@@ -1,0 +1,4 @@
+praw.ini
+./data/film_discussions
+.ipynb_checkpoints
+__pycache__
