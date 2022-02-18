@@ -1,4 +1,9 @@
 praw.ini
-./data/film_discussions
+data/
 .ipynb_checkpoints
 __pycache__
+datm/
+models/
+quality.py
+first700.txt
+Test_collect_comments_through_ids.ipynb

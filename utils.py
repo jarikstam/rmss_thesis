@@ -82,7 +82,14 @@ def get_comments_data(reddit, submission_id, comment_attributes=('comment.id', '
     submission.comments.replace_more(limit=None)
 
     # eval turns the string into a functioning attribue, the dictionary is needed to tell eval that 'comment' is coming from the global environment
-    comments_data = [[eval(comment_attribute, {"comment":comment, "submission":submission}) for comment_attribute in comment_attributes] for comment in submission.comments.list()]
+    # This old line perhaps caused errors for deleted comments, thus the new version.
+    #comments_data = [[eval(comment_attribute, {"comment":comment, "submission":submission}) for comment_attribute in comment_attributes] for comment in submission.comments.list()]
+    comments_data = []
+    for comment in submission.comments.list():
+        if comment.author is not None:
+            comment_data = [eval(comment_attribute, {"comment":comment, "submission":submission}) for comment_attribute in comment_attributes]
+            comments_data.append(comment_data)
+
     return comments_data
 
 
@@ -105,12 +112,13 @@ def add_rows(conn, table_name, n_columns, data_rows):
     conn.commit()
     return len(data_rows)
 
-def interact_with_db(conn, execute_sql, fetch=None):
+def interact_with_db(conn, execute_sql, fetch=None, commit=False):
     """
     Execute something in SQL, potentially fetch
     :param conn: A connection object
     :param execute_sql: An sql execute statement
     :param fetch: A string with a complete fetch statement
+    :param commit: Boolean to commit
     :return: if fetch!=None returns the fetched object
     """
     cur = conn.cursor()
@@ -118,6 +126,8 @@ def interact_with_db(conn, execute_sql, fetch=None):
     if fetch != None:
         x = eval(fetch)
         return x
+    if commit == True:
+        conn.commit()
 
 def strip_accents(text):
     """
