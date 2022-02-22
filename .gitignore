@@ -3,6 +3,7 @@ data/
 .ipynb_checkpoints
 __pycache__
 datm/
+datm_ngrams/
 models/
 quality.py
 first700.txt
