@@ -4,7 +4,13 @@ data/
 __pycache__
 datm/
 datm_ngrams/
+output/
 models/
 quality.py
 first700.txt
 Test_collect_comments_through_ids.ipynb
+twitter_keys.py
+.Rproj.user
+.RData
+.RHistory
+Thesis.Rproj

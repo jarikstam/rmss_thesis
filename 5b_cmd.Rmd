@@ -1,0 +1,115 @@
+---
+title: "CMD"
+author: "Jarik Stam"
+date: "4-3-2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(word2vec)
+library(text2map)
+library(Matrix)
+library(tidyverse)
+library(data.table)
+library(lubridate)
+
+theme_set(theme_classic())
+```
+
+```{r}
+se <- function(x) sd(x)/sqrt(length(x))
+
+comments <- fread("data/comments.csv", data.table = FALSE)
+
+dtm <- comments %>% 
+  dtm_builder(tokenized_body, comment_id)
+
+comments <- as_tibble(comments) %>% 
+  mutate(date = as_date(as_datetime( created))) %>% 
+  select(!c(body, created, tokenized_body, month))
+
+model <- read.word2vec(file = "./models/gensim_model_window7_vector_300_kv.w2v", normalize = TRUE)
+
+
+wv <- read_csv("data/wvdf.csv")
+wv <- column_to_rownames(wv, "...1")
+wv <- data.matrix(wv, rownames.force = TRUE)
+```
+
+# Concept Mover's Distance
+https://cran.r-project.org/web/packages/text2map/vignettes/CMDist-concept-movers-distance.html
+Options: single words, compound words, semantic directions, centroids.
+
+```{r}
+concept_words <- c("metoo", "blm", "sexism", "racism", "discrimination")
+centroid_words <- c("metoo", "blm", "sexism", "racism", "discrimination", "centroid")
+concept_centroid <- get_centroid(concept_words, wv)
+
+predict(model, newdata = concept_words, type = "nearest", top_n = 5)
+
+doc_closeness <- CMDist(dtm = dtm, cw = concept_words, cv = concept_centroid, wv = wv) %>% 
+  rename("centroid" = "metoo_centroid")
+
+doc_closeness %>% 
+  head()
+```
+
+
+```{r}
+# Grouped by date
+daily <- comments %>% 
+  left_join(doc_closeness, by=c("comment_id" = "doc_id")) %>% 
+  group_by(date = floor_date(date, "month")) %>%
+  summarise(date = min(date),
+            across(all_of(centroid_words), list(mean = mean, se = se))) %>% 
+  pivot_longer(
+    !date,
+    names_to = c("keyword", ".value"),
+    names_sep = "_"
+  )
+
+daily %>% 
+  filter(date > ymd("2014-01-01")) %>% 
+  arrange(desc(mean)) %>% 
+  head(20)
+  
+daily %>% 
+  filter(date >= ymd("2014-01-01"),
+         date < ymd("2022-01-01"),
+         #keyword %in% c("blm", "metoo")
+         ) %>% 
+  ggplot(aes(date, mean, color=keyword, fill=keyword, ymin=mean-se, ymax=mean+se)) + 
+  #geom_line() +
+  #geom_ribbon(alpha=.2) +
+  geom_smooth(method="lm", se=F) +
+  geom_vline(xintercept = as.numeric(ymd("2017-10-1")), linetype=2) +
+  geom_vline(xintercept = as.numeric(ymd("2020-5-1")), linetype=2) +
+  scale_x_date(date_breaks = "2 months", date_labels = "%m - %y",
+               expand = expansion(mult = c(0, 0))) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+
+# At the comment level
+bravo <- comments %>% 
+  left_join(doc_closeness, by=c("comment_id" = "doc_id")) %>% 
+  select(!c(body, created, tokenized_body, month)) %>% 
+  filter(date >= ymd("2014-01-01"),
+         date < ymd("2022-01-01")) %>% 
+  reshape2::melt(measure.vars=centroid_words,
+       variable.name="keyword",
+       value.name = "CMD")
+
+bravo %>% 
+  head()
+
+bravo %>%
+  ggplot(aes(date, CMD, color=keyword)) + 
+  geom_smooth(method="lm", se=T) +
+  geom_vline(xintercept = as.numeric(ymd("2017-10-1")), linetype=2) +
+  geom_vline(xintercept = as.numeric(ymd("2020-5-1")), linetype=2) +
+  scale_x_date(date_breaks = "2 months", date_labels = "%m - %y",
+               expand = expansion(mult = c(0, 0))) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+```
+
