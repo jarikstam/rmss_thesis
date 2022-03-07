@@ -18,24 +18,33 @@ library(lubridate)
 theme_set(theme_classic())
 ```
 
-```{r}
+```{r functions}
 se <- function(x) sd(x)/sqrt(length(x))
+```
 
+
+```{r data}
 comments <- fread("data/comments.csv", data.table = FALSE)
 
 dtm <- comments %>% 
   dtm_builder(tokenized_body, comment_id)
 
 comments <- as_tibble(comments) %>% 
-  mutate(date = as_date(as_datetime( created))) %>% 
-  select(!c(body, created, tokenized_body, month))
+  mutate(date = as_date(as_datetime(created))) %>% 
+  select(!c(body, created, tokenized_body))
 
 model <- read.word2vec(file = "./models/gensim_model_window7_vector_300_kv.w2v", normalize = TRUE)
-
 
 wv <- read_csv("data/wvdf.csv")
 wv <- column_to_rownames(wv, "...1")
 wv <- data.matrix(wv, rownames.force = TRUE)
+
+twitter <- read_csv("data/keywords_daily_count.csv") %>% 
+  reshape2::melt(
+    id.vars = "Date",
+    variable.name = "movement",
+    value.name = "tweets"
+  )
 ```
 
 # Concept Mover's Distance
@@ -47,7 +56,7 @@ concept_words <- c("metoo", "blm", "sexism", "racism", "discrimination")
 centroid_words <- c("metoo", "blm", "sexism", "racism", "discrimination", "centroid")
 concept_centroid <- get_centroid(concept_words, wv)
 
-predict(model, newdata = concept_words, type = "nearest", top_n = 5)
+predict(model, newdata = c("oscars"), type = "nearest", top_n = 5)
 
 doc_closeness <- CMDist(dtm = dtm, cw = concept_words, cv = concept_centroid, wv = wv) %>% 
   rename("centroid" = "metoo_centroid")
@@ -61,34 +70,77 @@ doc_closeness %>%
 # Grouped by date
 daily <- comments %>% 
   left_join(doc_closeness, by=c("comment_id" = "doc_id")) %>% 
-  group_by(date = floor_date(date, "month")) %>%
+  group_by(date = floor_date(date, "day")) %>%
   summarise(date = min(date),
             across(all_of(centroid_words), list(mean = mean, se = se))) %>% 
   pivot_longer(
     !date,
     names_to = c("keyword", ".value"),
     names_sep = "_"
-  )
+  ) %>% 
+  mutate(keyword = case_when(keyword=="blm" ~ "BLM",
+                             keyword=="metoo" ~ "MeToo",
+                             T ~ str_to_title(keyword))) %>% 
+  left_join(twitter, by=c("date" = "Date", "keyword" = "movement"))
 
 daily %>% 
   filter(date > ymd("2014-01-01")) %>% 
-  arrange(desc(mean)) %>% 
+  arrange(desc(date)) %>% 
   head(20)
   
 daily %>% 
   filter(date >= ymd("2014-01-01"),
          date < ymd("2022-01-01"),
-         #keyword %in% c("blm", "metoo")
+         keyword %in% c("BLM", "MeToo")
          ) %>% 
   ggplot(aes(date, mean, color=keyword, fill=keyword, ymin=mean-se, ymax=mean+se)) + 
   #geom_line() +
   #geom_ribbon(alpha=.2) +
-  geom_smooth(method="lm", se=F) +
+  geom_smooth(method="loess", se=T) +
   geom_vline(xintercept = as.numeric(ymd("2017-10-1")), linetype=2) +
   geom_vline(xintercept = as.numeric(ymd("2020-5-1")), linetype=2) +
   scale_x_date(date_breaks = "2 months", date_labels = "%m - %y",
                expand = expansion(mult = c(0, 0))) +
   theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+
+daily %>% 
+  filter(date >= ymd("2014-01-01"),
+         date < ymd("2022-01-01"),
+         keyword %in% c("BLM", "MeToo")
+  ) %>% 
+  group_by(keyword) %>%
+  mutate(fit = lm(mean ~ log10(tweets))$fitted.values) %>%
+  slice_max(fit) %>% 
+  ungroup() %>% 
+  mutate(label = keyword) %>% 
+  right_join(daily) %>% 
+  filter(date >= ymd("2014-01-01"),
+         date < ymd("2022-01-01"),
+         keyword %in% c("BLM", "MeToo")
+  ) %>% 
+  ggplot(aes(tweets, mean, fill=keyword)) +
+  geom_smooth(aes(color=keyword), method="lm") +
+  scale_x_log10(
+                limits = c(100,10^7),
+                breaks = scales::log_breaks(6),
+                labels = scales::comma,
+                expand = expansion(mult = c(0, 0.02))
+                ) +
+  scale_y_continuous(
+                     expand = expansion(mult = c(0, 0))) +
+  labs(
+    x = "Daily Count of Tweets Using the Keyword",
+    y = "Mean Concept Mover's Distance From Keyword",
+    color = "Keyword:",
+    fill = "Keyword:",
+    title = "Effect of Social Movements' Daily Visibility on Twitter on Reference to Those Movemnts in Film Discussion Threads on Reddit",
+    caption = "Data from Jan. 1, 2014 to Dec. 31, 2021."
+  ) +
+  ggrepel::geom_text_repel(aes(y=fit, label=label), na.rm=T, show.legend = F,
+                           direction = "y", nudge_y = .001,
+                           min.segment.length = Inf
+             ) +
+  theme(legend.position = "none")
 
 # At the comment level
 bravo <- comments %>% 
@@ -100,16 +152,14 @@ bravo <- comments %>%
        variable.name="keyword",
        value.name = "CMD")
 
-bravo %>% 
-  head()
-
 bravo %>%
-  ggplot(aes(date, CMD, color=keyword)) + 
-  geom_smooth(method="lm", se=T) +
+  ggplot(aes(date, CMD, color=keyword, fill=keyword)) + 
+  geom_smooth(method = lm) +
   geom_vline(xintercept = as.numeric(ymd("2017-10-1")), linetype=2) +
   geom_vline(xintercept = as.numeric(ymd("2020-5-1")), linetype=2) +
   scale_x_date(date_breaks = "2 months", date_labels = "%m - %y",
                expand = expansion(mult = c(0, 0))) +
   theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+
 ```
 
