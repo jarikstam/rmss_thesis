@@ -13,14 +13,14 @@ Description..
 ### Reddit Film Discussion Comments
 
 [Film\_discussions](data/film\_discussions) is a SQLite database with data collected from film discussion threads on [Reddit.com/r/movies](https://www.reddit.com/r/movies). It contains three tables:
-- submissions; collected in [step 1](#1.-collecting-reddit-submissions) which contains the columns:
+- submissions; collected in [step 1](#1-collecting-reddit-submissions) which contains the columns:
   - submission\_id
   - title
   - score
   - num\_comments
   - url
   - created
-- comments; collected in [step 2](#2.-collecting-reddit-comments) which contains the columns:
+- comments; collected in [step 2](#2-collecting-reddit-comments) which contains the columns:
   - comment\_id
   - submission\_id
   - body
