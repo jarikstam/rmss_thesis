@@ -11,20 +11,50 @@ editor_options:
 library(word2vec)
 library(text2map)
 library(Matrix)
-library(tidyverse)
 library(data.table)
+library(tidyverse)
 library(lubridate)
+library(lme4)
+library(xtable)
 
 theme_set(theme_classic())
 ```
 
+```{r  files}
+comments_file <- "data/comments.csv"
+binary_wv_file <- "./models/gensim_model_window7_vector_300_kv.w2v"
+wvdf_file <- "data/wvdf.csv"
+count_file <- "data/keywords_daily_count.csv"
+```
+
+
 ```{r functions}
 se <- function(x) sd(x)/sqrt(length(x))
+
+get_icc <- function(model) {
+  VarCorr(model) %>% 
+    as_tibble() %>%
+    mutate(icc=vcov/sum(vcov))
+}
+
+get_coefs <- function(model) {
+  summary(model)$coefficients %>% 
+    as_tibble(rownames = "Variable") %>% 
+    rename("Coef." = Estimate,
+           "S.E." = `Std. Error`,
+           "T" = `t value`)
+}
+
+get_sum <- function(model) {
+  get_coefs(model)
+  get_icc(model)
+  logLik(model)[1]
+}
 ```
 
 
 ```{r data}
-comments <- fread("data/comments.csv", data.table = FALSE)
+comments <- fread(comments_file, data.table = FALSE)
 
 dtm <- comments %>% 
   dtm_builder(tokenized_body, comment_id)
@@ -33,25 +63,29 @@ comments <- as_tibble(comments) %>%
   mutate(date = as_date(as_datetime(created))) %>% 
   select(!c(body, created, tokenized_body))
 
-model <- read.word2vec(file = "./models/gensim_model_window7_vector_300_kv.w2v", normalize = TRUE)
+model <- read.word2vec(file = binary_wv_file, normalize = TRUE)
 
-wv <- read_csv("data/wvdf.csv")
+wv <- read_csv(wvdf_file)
 wv <- column_to_rownames(wv, "...1")
 wv <- data.matrix(wv, rownames.force = TRUE)
 
-twitter <- read_csv("data/keywords_daily_count.csv") %>% 
+twitter <- read_csv(count_file) %>% 
   reshape2::melt(
     id.vars = "Date",
     variable.name = "movement",
     value.name = "tweets"
   )
+
+date_metoo <- twitter %>% 
+  filter(movement == "MeToo") %>% 
+  slice_max(tweets) %>%
+  .[[1,1]]
 ```
 
-# Concept Mover's Distance
 https://cran.r-project.org/web/packages/text2map/vignettes/CMDist-concept-movers-distance.html
 Options: single words, compound words, semantic directions, centroids.
 
-```{r}
+```{r cmd}
 concept_words <- c("metoo", "blm", "sexism", "racism", "discrimination")
 centroid_words <- c("metoo", "blm", "sexism", "racism", "discrimination", "centroid")
 concept_centroid <- get_centroid(concept_words, wv)
@@ -61,15 +95,29 @@ predict(model, newdata = c("oscars"), type = "nearest", top_n = 5)
 doc_closeness <- CMDist(dtm = dtm, cw = concept_words, cv = concept_centroid, wv = wv) %>% 
   rename("centroid" = "metoo_centroid")
 
-doc_closeness %>% 
-  head()
+comments <- comments %>% 
+  left_join(doc_closeness, by=c("comment_id" = "doc_id"))
 ```
 
+```{r explore data} 
+# 
+comments %>%
+  select(date, submission_id) %>% 
+  group_by(submission_id) %>% 
+  summarise(days_since_sub = median(date-min(date))) %>% 
+  filter(days_since_sub < 30) %>% 
+  ggplot(aes(days_since_sub)) +
+  stat_ecdf() +
+  geom_vline(xintercept = 7, linetype=2) +
+  scale_x_continuous(breaks = seq(0, 30, 1), limits = c(0,30), expand = c(0,0)) +
+  labs(
+    title = "The median number of days after a submission for comments to be posted ",
+    x = "Number of days since submission",
+    y = "Cumulative % of submissions"
+  )
 
-```{r}
-# Grouped by date
+# Grouped by date ----
 daily <- comments %>% 
-  left_join(doc_closeness, by=c("comment_id" = "doc_id")) %>% 
   group_by(date = floor_date(date, "day")) %>%
   summarise(date = min(date),
             across(all_of(centroid_words), list(mean = mean, se = se))) %>% 
@@ -142,10 +190,8 @@ daily %>%
              ) +
   theme(legend.position = "none")
 
-# At the comment level
+# At the comment level ----
 bravo <- comments %>% 
-  left_join(doc_closeness, by=c("comment_id" = "doc_id")) %>% 
-  select(!c(body, created, tokenized_body, month)) %>% 
   filter(date >= ymd("2014-01-01"),
          date < ymd("2022-01-01")) %>% 
   reshape2::melt(measure.vars=centroid_words,
@@ -162,4 +208,83 @@ bravo %>%
   theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
 
 ```
+
+```{r sexism}
+sexism <- twitter %>% 
+  filter(movement == "MeToo") %>% 
+  inner_join(comments, by=c("Date" = "date")) %>% 
+  select(!c(movement, blm, racism, discrimination, centroid)) %>%
+  filter(Date >= ymd("2014-01-01"),
+         Date < ymd("2022-01-01")) %>% 
+  drop_na() %>% 
+  mutate(
+    after_peak = if_else(Date > date_metoo, 1, 0)
+  )
+
+sexism %>% head()
+
+m1 <- lmer(sexism ~ (1|submission_id) + (1|author), sexism, REML = FALSE)
+
+m2 <- lmer(sexism ~ score + (1|submission_id) + (1|author), 
+           sexism, REML = FALSE)
+
+m3 <- lmer(sexism ~ score + log(tweets) + after_peak + (1|submission_id) + (1|author), 
+           sexism, REML = FALSE)
+
+
+get_coefs(m3)
+get_icc(m3)
+
+c(m1,m2,m3) %>% 
+  map(get_coefs) %>% 
+  bind_rows(.id = "Model") %>% 
+  pivot_wider(
+    names_from = "Model",
+    values_from = 3:5,
+    names_glue = "M{Model}_{.value}"
+  ) %>% 
+  select(order(colnames(.))) %>% 
+  select(Variable, everything()) %>% 
+  mutate(across(where(is.numeric), ~ round(.x, digits = 2))) %>% 
+  #rename_with(~ str_c("{", .x, "}")) %>% 
+  xtable(
+    caption = "Multilevel Model",
+    label = "Multilevel",
+    align = c("l", "l", rep("C", ncol(.)-1)),
+    #display = c("s", "s", rep("f", ncol(.)-1))
+  ) %>% 
+  print(
+    table.placement = "tb",
+    caption.placement = "top",
+    latex.environments = "threeparttable",
+    tabular.environment = "tabular*",
+    include.rownames = F,
+    #math.style.negative = T,
+    print.results = F,
+    booktabs = T,
+    width = "\\textwidth",
+    comment = F,
+    size = "\\sisetup{parse-numbers= false, mode=text}",
+    #add.to.row = list(pos=list(0), command=c("gu"))
+  ) %>% 
+    str_replace(., "(?<=)toprule", str_c("toprule\n", 
+                                     str_replace_all(
+                                     toString(map(seq(str_count(., "(M\\d\\\\_)")/3),
+                                                         ~ str_c(" & \\\\multicolumn{3}{c}{Model ", 
+                                                                 as.character(.x), "}"))),
+                                     ", ", ""
+                                     ),
+                                     " \\\\\\\\"
+                                     )
+            ) %>% 
+  str_replace(., "C{3,999}", str_c(" @{\\\\extracolsep{\\\\fill}} *{", str_length(str_extract(., "C{3,999}")), "}{S[table-format=-2.2]}")) %>% 
+  str_replace_all("Coef.", "{Coef.}") %>% 
+str_replace_all("S.E.", "{S.E.}") %>% 
+str_replace_all("_T", "_{T}") %>% 
+  str_replace_all("(M\\d\\\\_)", "") %>% 
+  cat()
+
+
+```
+
 
