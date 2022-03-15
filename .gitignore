@@ -1,5 +1,6 @@
 praw.ini
-data/
+!data/
+data/*
 .ipynb_checkpoints
 __pycache__
 datm/
@@ -14,3 +15,6 @@ twitter_keys.py
 .RData
 .RHistory
 Thesis.Rproj
+
+!data/submissions_annotated.csv
+!data/keywords_daily_count.csv
