@@ -45,44 +45,9 @@ predict_submission <- function(model) {
     select(grp, {{ model_name }}) %>% 
     rename("submission_id" = grp)
 }
-
-lm_fitted <- function(.data, formula) {
-  if (dplyr::is_grouped_df(.data)) {
-      return(dplyr::do(.data, lm_fitted(., formula)))
-    }
-  model <- lm(formula=formula, data=.data)
-  pred_vals = dplyr::tibble(
-    fit = predict(model),
-    se = predict(model, se.fit=T)$se.fit
-  )
-  .data <- bind_cols(.data, pred_vals)
-  .data
-}
-
-get_random <- function(model) {
-  VarCorr(model) %>% 
-    as_tibble() %>%
-    mutate(icc = vcov/sum(vcov),
-           icc = if_else(grp=="Residual", NaN, icc)) %>% 
-    select(!c(var2, sdcor))
-}
-
-# get_fixed <- function(model) {
-#   summary(model)$coefficients %>% 
-#     as_tibble(rownames = "Variable") %>% 
-#     rename("Coef." = Estimate,
-#            "S.E." = `Std. Error`,
-#            "T" = `t value`)
-# }
-
-get_sum <- function(model) {
-  fm <- get_fixed(model)
-  rm <- get_random(model)
-  ll <- logLik(model)[1]
-  return(list(fm, rm, ll))
-} 
 ```
 ```{r data}
+# Importing comments and creating dtm ----
 comments <- fread(analysis_file, data.table = FALSE)
 
 dtm <- comments %>% 
@@ -102,34 +67,11 @@ comments <- as_tibble(comments) %>%
   # ))
   select(!all_of(pol_names))
 
-comments <- comments %>% 
-  mutate(
-    across(all_of(c(movements, "politics_comments", "vote_count")), ~ log(.x+1)),
-    # across(all_of(c(movements, "politics_comments")), ~ if_else(.x==0, as.integer(1), .x)),
-    # across(all_of(c(movements, "politics_comments")), log),
-    across(c(score), ~ scale(.x)[,1])
-  ) %>% 
-  mutate(Date = date(Date)) %>% 
-  mutate(across(
-    ends_with("keywords"), ~ if_else(.x == 0, 0, 1)
-  ))
-
-# comments <- comments %>% 
-#   filter(!author %in% c("AutoModerator", "[deleted]", "None"))
-
-# There are many usernames "None", which are from deleted accounts. This makes them all unique
-# If doing this, need to do something about politics_comments
-comments <- comments %>% 
-  mutate(
-    author = if_else(
-      author %in% c("[deleted]", "None"), 
-      str_c("#", as.character(row_number())), # Hashtags are illegal characters in usernames, thus now these names are assured to be unique.
-      author
-    ),
-    # Replacing politics_comments with the mean of the other rows
-    politics_comments = if_else(str_detect(author, "#"), NaN, politics_comments),
-    politics_comments = if_else(is.na(politics_comments), mean(politics_comments, na.rm=T), politics_comments)
-  )
+# Filtering comments ----
+# AutoModerator is a bot used by Reddit moderators for automized moderation
+# [deleted] and None are unknown authors (mostly) because of deleted accounts whose comments remain, meaning I can't test for within-author change
+comments <- comments %>%
+  filter(!author %in% c("AutoModerator", "[deleted]", "None"))
 
 # Removing days from before min_date because before that data is very sparse
 # From may 2013 there is at least on film discussion thread per month
@@ -141,22 +83,47 @@ min_date <- ymd("2013-05-01")
 comments <- comments %>%
   filter(Date >= min_date,
          Date < ymd("2022-02-01")) %>%
-  mutate(days = interval(min_date, Date) / days(1),
-         # days_freq = days / max(days)
-         )
-
-comments <- comments %>% 
   mutate(years = interval(min_date, Date) / years(1))
 
 comments <- comments %>% 
+  group_by(submission_id) %>% 
+  mutate(thread_date = min(Date),
+         thread_age = interval(min_date, min(Date)) / years(1)) %>% 
+  ungroup() %>% 
+  mutate(comment_age = as.integer(Date - thread_date))
+
+# For a long time, one wouldn't be able to comment in submissions older than 180 days
+# This was disabled 15-okt-2021, meaning there are now a few comments way older than 180 days (i.e., 3000 days), I think these comments are outliers
+# See lines 291-292 from https://github.com/reddit-archive/reddit/commit/0ae8f2fb96cd39a01e8bff2cb4b1829b7bdbd0a8#diff-f28c2f2d93f455301ef0180437b545fdR291
+
+comments <- comments %>% 
+  filter(comment_age <= 180)
+
+# Removing authors who haven't commented in at least 2 different submissions, because they add a lot of calculation without adding much interesting variation
+comments <- comments %>% 
   group_by(author) %>% 
   filter(n_distinct(submission_id) > 1) %>% 
+  # Doing log(x+1) because that's what I do with other logged vars
+  mutate(user_comments = log(n()+1)) %>% 
   ungroup()
 
+# Mutating variables ----
+comments <- comments %>% 
+  mutate(
+    # Mutating to log(x+1) for several vars because they minimum zero and very long righthand tails
+    across(all_of(c(movements, "politics_comments", "vote_count")), ~ log(.x+1)),
+    # Standardizing score to make its range more similar to that of other vars
+    across(c(score), ~ scale(.x)[,1]),
+    # Converting to datetype
+    Date = date(Date),
+    # Creating a dummy because the var isn't very continuous
+    across(ends_with("keywords"), ~ if_else(.x == 0, 0, 1))
+    )
+
+# Other data ----
 # model <- read.word2vec(file = binary_wv_file, normalize = TRUE)
 
 tmdb <- read_delim(tmdb_file, delim = ";")
-
 genres <- tmdb %>% select(`Science Fiction`:Documentary) %>% colnames()
 
 comments <- tmdb %>% 
@@ -174,12 +141,12 @@ date_metoo <- ymd("2017-10-15")
 
 
 ```
-
-https://cran.r-project.org/web/packages/text2map/vignettes/CMDist-concept-movers-distance.html
-Options: single words, compound words, semantic directions, centroids.
-
 ```{r cmd}
-# The problem with taking a single seed word is that grammar matters. If it's a plural noun, it more likely to find other plural nouns etc. 
+# https://cran.r-project.org/web/packages/text2map/vignettes/CMDist-concept-movers-distance.html
+# Options: single words, compound words, semantic directions, centroids.
+
+# The problem with taking a single seed word is that grammar matters. If it's a plural noun, it more likely to find other plural nouns etc.
+# That said, differences are small
 
 concept_words <- c("metoo", "blm", "sexism", "racism", "discrimination")
 sexism_words <- c("sexism", "metoo", "sexist", "sexual_harassment", "misogyny", "patriarchy",
@@ -187,25 +154,29 @@ sexism_words <- c("sexism", "metoo", "sexist", "sexual_harassment", "misogyny", 
 racism_words <- c("racism", "blm","racist", "racists", "african_americans",
                   "racial", "segregation", "systemic_racism", "police_brutality", "white_supremacy",
                   "institutional_racism", "race_relations", "bigoted")
+discrimination_words <- c("discrimination", sexism_words, racism_words)
 
 # predict(model, newdata = "racism", type = "nearest", top_n = 10)
 
-sexism_centroid <- get_centroid(sexism_words, wv)
-racism_centroid <- get_centroid(racism_words, wv)
+# sexism_centroid <- get_centroid(sexism_words, wv)
+# racism_centroid <- get_centroid(racism_words, wv)
+discrimination_centroid <- get_centroid(discrimination_words, wv)
 
-doc_closeness <- CMDist(dtm = dtm, cw = concept_words, cv = sexism_centroid, wv = wv)
-racism_closeness <- CMDist(dtm = dtm, cv = racism_centroid, wv = wv)
+# doc_closeness <- CMDist(dtm = dtm, cw = concept_words, cv = sexism_centroid, wv = wv)
+# racism_closeness <- CMDist(dtm = dtm, cv = racism_centroid, wv = wv)
+discrimination_closeness <- CMDist(dtm = dtm, cv = discrimination_centroid, wv = wv)
 
-doc_closeness <- doc_closeness %>% 
-  rename_with(~ str_c(.x, "_cmd"),
-              all_of(concept_words)
-  )
+# doc_closeness <- doc_closeness %>% 
+#   rename_with(~ str_c(.x, "_cmd"),
+#               all_of(concept_words)
+#   )
 
 comments <- comments %>% 
-  left_join(doc_closeness, by=c("comment_id" = "doc_id")) %>% 
-  left_join(racism_closeness, by=c("comment_id" = "doc_id"))
+  # left_join(doc_closeness, by=c("comment_id" = "doc_id")) %>% 
+  # left_join(racism_closeness, by=c("comment_id" = "doc_id")) %>% 
+  left_join(discrimination_closeness, by=c("comment_id" = "doc_id"))
 
-rm(dtm, doc_closeness, racism_closeness, wv)
+rm(dtm, doc_closeness, racism_closeness, discrimination_closeness, wv)
 ```
 ```{r descriptives}
 # Number of discussion threads per month ----
@@ -269,7 +240,7 @@ m1 <- comments %>%
 
 # step 2: Comment level variables ----
 m2 <- comments %>% 
-  lmer(sexism_centroid ~ years +
+  lmer(sexism_centroid ~ comment_age +
          (1|submission_id) + (1|author), 
        data = ., REML = FALSE,
        control = lmerControl(optimizer ="Nelder_Mead")
@@ -277,28 +248,18 @@ m2 <- comments %>%
 
 # step 3: Author and submission level variables ----
 m3 <- comments %>% 
-  lmer(sexism_centroid ~ years + 
-         politics_comments + vote_average + vote_count + sexism_keywords + 
+  lmer(sexism_centroid ~ comment_age +
+         politics_comments + user_comments +
+         thread_age +
+         vote_average + vote_count + sexism_keywords + 
          MeToo +  
          (1|submission_id) + (1|author), 
        data = ., REML = FALSE,
        control = lmerControl(optimizer ="Nelder_Mead")
        )
 
-m3b <- comments %>% 
-  lmer(sexism_centroid ~ years + 
-         politics_comments + vote_average + vote_count +
-         sexism_keywords + racism_keywords +
-         MeToo +
-         Romance + Western + History + Family + Drama + Crime +
-         (1|submission_id) + (1|author), 
-       data = ., REML = FALSE,
-       control = lmerControl(optimizer ="Nelder_Mead")
-       )
-
 # paste(genres, collapse = " + ")
-
-m3c <- comments %>% 
+m3b <- comments %>% 
   lmer(sexism_centroid ~ years + 
          politics_comments + vote_average + vote_count +
          sexism_keywords + racism_keywords +
@@ -433,6 +394,59 @@ pred_values %>%
 ```
 
 ```{r graveyard} 
+# functions ----
+
+lm_fitted <- function(.data, formula) {
+  if (dplyr::is_grouped_df(.data)) {
+      return(dplyr::do(.data, lm_fitted(., formula)))
+    }
+  model <- lm(formula=formula, data=.data)
+  pred_vals = dplyr::tibble(
+    fit = predict(model),
+    se = predict(model, se.fit=T)$se.fit
+  )
+  .data <- bind_cols(.data, pred_vals)
+  .data
+}
+
+get_random <- function(model) {
+  VarCorr(model) %>% 
+    as_tibble() %>%
+    mutate(icc = vcov/sum(vcov),
+           icc = if_else(grp=="Residual", NaN, icc)) %>% 
+    select(!c(var2, sdcor))
+}
+
+# get_fixed <- function(model) {
+#   summary(model)$coefficients %>% 
+#     as_tibble(rownames = "Variable") %>% 
+#     rename("Coef." = Estimate,
+#            "S.E." = `Std. Error`,
+#            "T" = `t value`)
+# }
+
+get_sum <- function(model) {
+  fm <- get_fixed(model)
+  rm <- get_random(model)
+  ll <- logLik(model)[1]
+  return(list(fm, rm, ll))
+} 
+# unique user ids ----
+
+# There are many usernames "None", which are from deleted accounts. This makes them all unique
+# If doing this, need to do something about politics_comments
+comments <- comments %>% 
+  mutate(
+    author = if_else(
+      author %in% c("[deleted]", "None"), 
+      str_c("#", as.character(row_number())), # Hashtags are illegal characters in usernames, thus now these names are assured to be unique.
+      author
+    ),
+    # Replacing politics_comments with the mean of the other rows
+    politics_comments = if_else(str_detect(author, "#"), NaN, politics_comments),
+    politics_comments = if_else(is.na(politics_comments), mean(politics_comments, na.rm=T), politics_comments)
+  )
+
 # Explore data ----
 comments %>%
   select(date, submission_id) %>% 
