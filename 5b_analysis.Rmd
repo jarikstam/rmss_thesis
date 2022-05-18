@@ -6,7 +6,6 @@ output: html_document
 editor_options: 
   chunk_output_type: console
 ---
-
 ```{r setup}
 library(word2vec)
 library(text2map)
@@ -19,58 +18,84 @@ library(optimx)
 library(xtable)
 library(stargazer)
 library(ggcorrplot)
+library(vtable)
 
 theme_set(cowplot::theme_minimal_hgrid())
 Sys.setlocale("LC_TIME", "English")
 ```
 ```{r files}
-analysis_file <- "data/comments_analysis.csv"
-topics_file <- "data/topics_annotated.csv"
+analysis_file <- "data/comments_analysis_v3.csv"
 tmdb_file <- "data/submissions_tmdb.csv"
+tweets_file <- "data/keywords_daily_count.csv"
 
 figures_path <- "figures"
+output_path <- "output"
 
 binary_wv_file <- "./models/gensim_model_window25_vector300_kv.w2v"
 wvdf_file <- "data/wvdf.csv"
 ```
+```{r params}
+min_date <- ymd("2013-05-01")
+max_date <- ymd("2022-02-01")
+date_metoo <- ymd("2017-10-15")
+date_floyd <- ymd("2020-6-2")
+date_reign <- ymd("2015-1-15")
+
+movements <- c("BLM", "MeToo", "OscarsSoWhite")
+hashtag_names <- c("#OscarsSoWhite", "#MeToo", "#BlackLivesMatter")
+
+# viz params ----
+# colors
+corr_colors <- rev(RColorBrewer::brewer.pal(3, "RdYlBu"))
+
+tweets_color_scale <- viridis::viridis(n=3, option = "inferno")
+names(tweets_color_scale) <- hashtag_names
+
+# Linetypes
+tweets_lines_scale <- c("1151", "1111", "solid")
+names(tweets_lines_scale) <- hashtag_names
+
+```
 ```{r functions}
 se <- function(x) sd(x)/sqrt(length(x))
 
-predict_submission <- function(model) {
+predict_submission <- function(.data, model) {
   model_name <- deparse(substitute(model))
-  ranef(model, condVar=F, whichel="submission_id") %>% 
+  df <- ranef(model, condVar=F, whichel="submission_id") %>% 
     as_tibble() %>% 
     mutate({{ model_name }} := condval #+ fixef(model)[1]
            ) %>% 
     select(grp, {{ model_name }}) %>% 
     rename("submission_id" = grp)
+    left_join(.data, df)
 }
+
+plot_corr <- function(.data) {
+  .data %>% 
+    cor() %>% 
+    ggcorrplot(lab=T, outline.col = "white",
+             colors = corr_colors,
+             show.legend = F, lab_size = 3,
+             tl.cex = 10,
+             show.diag = F)
+}
+
+save_plot <- function(plot, filename, width=10, height=6) {
+  ggsave(filename, plot, "pdf", figures_path,
+         width = width, height = height, units = "in", dpi = 1200)
+  
+  knitr::plot_crop(paste0(figures_path, "/", filename))
+}
+
 ```
 ```{r data}
-# Importing comments and creating dtm ----
-comments <- fread(analysis_file, data.table = FALSE)
-
-dtm <- comments %>% 
-  dtm_builder(tokenized_body, comment_id)
-
-pol_names <- read_delim(topics_file, delim=";") %>% 
-  filter(Category=="Politics") %>% 
-  distinct(Name) %>% 
-  pull()
-
-movements <- c("BLM", "MeToo", "OscarsSoWhite")
-
-comments <- as_tibble(comments) %>% 
-  select(!c(created, tokenized_body)) %>% 
-  # mutate(across(
-  #   all_of(pol_names), ~ .x*100
-  # ))
-  select(!all_of(pol_names))
-
 # Filtering comments ----
 # AutoModerator is a bot used by Reddit moderators for automized moderation
 # [deleted] and None are unknown authors (mostly) because of deleted accounts whose comments remain, meaning I can't test for within-author change
+comments <- fread(analysis_file, data.table = FALSE)
+
 comments <- comments %>%
+  as_tibble() %>% 
   filter(!author %in% c("AutoModerator", "[deleted]", "None"))
 
 # Removing days from before min_date because before that data is very sparse
@@ -78,19 +103,20 @@ comments <- comments %>%
 # And from after Jan 2022 because data might be incomplete
 # (i.e., those threads were still active at time of collection)
 # This only removes ~ 10000 comments
-min_date <- ymd("2013-05-01")
-
 comments <- comments %>%
   filter(Date >= min_date,
-         Date < ymd("2022-02-01")) %>%
-  mutate(years = interval(min_date, Date) / years(1))
+         Date < max_date)
+
+comments <- comments %>% 
+  select(!created)
 
 comments <- comments %>% 
   group_by(submission_id) %>% 
-  mutate(thread_date = min(Date),
+  mutate(Date = date(Date),
+         thread_date = min(Date),
          thread_age = interval(min_date, min(Date)) / years(1)) %>% 
   ungroup() %>% 
-  mutate(comment_age = as.integer(Date - thread_date))
+  mutate(comment_age = interval(thread_date, Date) / weeks(1))
 
 # For a long time, one wouldn't be able to comment in submissions older than 180 days
 # This was disabled 15-okt-2021, meaning there are now a few comments way older than 180 days (i.e., 3000 days), I think these comments are outliers
@@ -99,25 +125,30 @@ comments <- comments %>%
 comments <- comments %>% 
   filter(comment_age <= 180)
 
+# Exploration shows that there are many short comments with undeserved high scores on the vars.
+# E.g. 1-word comments like "yes" and "same" score over 2 sd's above 0.
+comments <- comments %>% 
+  filter(str_count(tokenized_body, "\\w+") >= 10)
+
 # Removing authors who haven't commented in at least 2 different submissions, because they add a lot of calculation without adding much interesting variation
 comments <- comments %>% 
   group_by(author) %>% 
   filter(n_distinct(submission_id) > 1) %>% 
   # Doing log(x+1) because that's what I do with other logged vars
-  mutate(user_comments = log(n()+1)) %>% 
+  mutate(movies_comments = log(n()+1)) %>% 
   ungroup()
 
 # Mutating variables ----
 comments <- comments %>% 
   mutate(
     # Mutating to log(x+1) for several vars because they minimum zero and very long righthand tails
-    across(all_of(c(movements, "politics_comments", "vote_count")), ~ log(.x+1)),
+    across(all_of(c(movements, "politics_comments")), ~ log(.x+1)),
     # Standardizing score to make its range more similar to that of other vars
-    across(c(score), ~ scale(.x)[,1]),
-    # Converting to datetype
-    Date = date(Date),
+    # across(all_of(c("score", "vote_count")), ~ scale(.x)[,1]),
     # Creating a dummy because the var isn't very continuous
-    across(ends_with("keywords"), ~ if_else(.x == 0, 0, 1))
+    across(ends_with("keywords"), ~ if_else(.x == 0, 0, 1)),
+    "thread_age^2" = thread_age^2,
+    film_title = str_replace_all(film_title, "&amp;", "&")
     )
 
 # Other data ----
@@ -129,51 +160,47 @@ genres <- tmdb %>% select(`Science Fiction`:Documentary) %>% colnames()
 comments <- tmdb %>% 
   select(all_of(c("submission_id", genres))) %>% 
   right_join(comments)
-
-wv <- read_csv(wvdf_file)
-wv <- column_to_rownames(wv, "...1")
-wv <- data.matrix(wv, rownames.force = TRUE)
-```
-```{r params}
-corr_colors <- rev(RColorBrewer::brewer.pal(3, "RdYlBu"))
-
-date_metoo <- ymd("2017-10-15")
-
-
 ```
 ```{r cmd}
 # https://cran.r-project.org/web/packages/text2map/vignettes/CMDist-concept-movers-distance.html
 # Options: single words, compound words, semantic directions, centroids.
 
+wv <- read_csv(wvdf_file) %>% 
+  column_to_rownames("...1") %>% 
+  data.matrix(rownames.force = TRUE)
+
+dtm <- comments %>% 
+  dtm_builder(tokenized_body, comment_id)
+
 # The problem with taking a single seed word is that grammar matters. If it's a plural noun, it more likely to find other plural nouns etc.
 # That said, differences are small
 
-concept_words <- c("metoo", "blm", "sexism", "racism", "discrimination")
+concept_words <- c("sexism", "racism", "discrimination")
 sexism_words <- c("sexism", "metoo", "sexist", "sexual_harassment", "misogyny", "patriarchy",
                   "sexualization", "sjws", "rape_culture", "toxic_masculinity")
-racism_words <- c("racism", "blm","racist", "racists", "african_americans",
-                  "racial", "segregation", "systemic_racism", "police_brutality", "white_supremacy",
+racism_words <- c("racism", "blm","racist", "racists", "racial", "segregation", "systemic_racism",
+                  "police_brutality", "white_supremacy",
                   "institutional_racism", "race_relations", "bigoted")
 discrimination_words <- c("discrimination", sexism_words, racism_words)
 
 # predict(model, newdata = "racism", type = "nearest", top_n = 10)
 
-# sexism_centroid <- get_centroid(sexism_words, wv)
-# racism_centroid <- get_centroid(racism_words, wv)
+sexism_centroid <- get_centroid(sexism_words, wv)
+racism_centroid <- get_centroid(racism_words, wv)
 discrimination_centroid <- get_centroid(discrimination_words, wv)
 
-# doc_closeness <- CMDist(dtm = dtm, cw = concept_words, cv = sexism_centroid, wv = wv)
-# racism_closeness <- CMDist(dtm = dtm, cv = racism_centroid, wv = wv)
+doc_closeness <- CMDist(dtm = dtm, cw = concept_words, cv = sexism_centroid, wv = wv)
+racism_closeness <- CMDist(dtm = dtm, cv = racism_centroid, wv = wv)
 discrimination_closeness <- CMDist(dtm = dtm, cv = discrimination_centroid, wv = wv)
 
-# doc_closeness <- doc_closeness %>% 
-#   rename_with(~ str_c(.x, "_cmd"),
-#               all_of(concept_words)
-#   )
+doc_closeness <- doc_closeness %>%
+  rename_with(~ str_c(.x, "_cmd"),
+              all_of(concept_words)
+  )
 
-comments <- comments %>% 
-  # left_join(doc_closeness, by=c("comment_id" = "doc_id")) %>% 
-  # left_join(racism_closeness, by=c("comment_id" = "doc_id")) %>% 
+comments <- comments %>%
+  left_join(doc_closeness, by=c("comment_id" = "doc_id")) %>%
+  left_join(racism_closeness, by=c("comment_id" = "doc_id")) %>%
   left_join(discrimination_closeness, by=c("comment_id" = "doc_id"))
 
 rm(dtm, doc_closeness, racism_closeness, discrimination_closeness, wv)
@@ -191,13 +218,29 @@ comments %>%
     expand = expansion(mult = c(0, 0))) + 
   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
 
+# Number of comments after creation date ----
+# plot_comment_age <- comments %>% 
+comments %>% 
+  filter(comment_age <= 30) %>% 
+  ggplot(aes(comment_age)) +
+  geom_bar(aes(y=..prop..)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 2),
+                     expand = expansion(mult = c(0,0.02))) +
+  scale_x_continuous(expand = expansion(mult = c(0,0))) +
+  labs(
+    x = "Days Between Thread Creation and Comment Creation",
+    y = "Proportion of Comments"
+  )
+
+# plot_comment_age
+
 # Effect of time ----
 comments %>% 
-  ggplot(aes(Date, sexism_centroid)) +
+  ggplot(aes(Date, discrimination_centroid)) +
   geom_smooth(method="lm", se=T, color="red", fill="red") +
   geom_smooth(method="lm", formula = "y ~ poly(x, 2)", se=T, color="yellow", fill="yellow") +
-  # geom_smooth(method="lm", formula = "y ~ poly(x, 3)", se=F, color="green") +
-  # geom_smooth(method="lm", formula = "y ~ poly(x, 4)", se=F, color="blue") +
+  geom_smooth(method="lm", formula = "y ~ poly(x, 3)", se=F, color="green") +
+  geom_smooth(method="lm", formula = "y ~ poly(x, 4)", se=F, color="blue") +
   geom_smooth(method="lm", formula = "y ~ poly(x, 5)", se=T, color="purple", fill="purple") +
   # scale_x_date(
   #   date_breaks = "1 years", date_labels = "%Y", 
@@ -206,64 +249,125 @@ comments %>%
                expand = expansion(mult = c(0, 0))) +
   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
 
+  
 # Descriptive statistics ----
+var_selection <- comments %>% 
+  select(all_of(c("thread_age", "comment_age", "politics_comments", movements, "sexism_keywords", "racism_keywords")) | ends_with("_cmd") | ends_with("_centroid")) %>% 
+  colnames()
+
 comments %>% 
-  select(where(is.numeric)) %>% 
+  select(var_selection) %>% 
   as.data.frame() %>% 
   stargazer(., nobs = FALSE, type = "text")
 
 # Correlations ----
-comments %>% 
-  select(where(is.numeric)) %>%
-  cor() %>% 
-  ggcorrplot(lab=T, outline.col = "white",
-             colors = corr_colors,
-             show.legend = F, lab_size = 3.5,
-             show.diag = F)
+plot_correlations <-  comments %>% 
+  select(var_selection) %>%
+  plot_corr()
 
+plot_correlations
+
+plot_concepts <-  comments %>% 
+  select(ends_with("_cmd") | ends_with("_centroid")) %>% 
+  plot_corr()
+
+plot_concepts
+
+# tmdb stuff ----
 tmdb %>% 
   select(where(is.numeric)) %>%
   select(sexism_keywords, racism_keywords, everything()) %>% 
-  cor() %>% 
-  ggcorrplot(lab=T, outline.col = "white",
-             colors = corr_colors,
-             show.legend = F, lab_size = 3,
-             show.diag = F)
+  plot_corr()
+
+tmdb %>% 
+  select(sexism_keywords, racism_keywords, film_title) %>% 
+  mutate(x = n()) %>% 
+  group_by(racism_keywords) %>% 
+  summarise(fre = n()/x) %>% 
+  tally()
+
+tmdb %>% 
+  select(sexism_keywords, racism_keywords, film_title) %>% 
+  arrange(desc(racism_keywords))
+
+tmdb %>% 
+  select(sexism_keywords, racism_keywords, film_title) %>% 
+  reshape2::melt(id.vars = "film_title", variable.name = "Keyword") %>% 
+  ggplot(aes(value, color = Keyword, fill = Keyword)) +
+  geom_bar(aes(y=..prop..), position = "dodge") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), n.breaks = 10)
 
 ```
 ```{r multilevel}
 # step 1: Intercept only model ----
 m1 <- comments %>% 
-  lmer(sexism_centroid ~ (1|submission_id) + (1|author), ., REML = FALSE,
-       control = lmerControl(optimizer ="Nelder_Mead")
+  lmer(
+    discrimination_centroid ~ 
+      (1|submission_id) + (1|author), ., REML = FALSE,
+    control = lmerControl(optimizer ="Nelder_Mead")
        )
 
 # step 2: Comment level variables ----
 m2 <- comments %>% 
-  lmer(sexism_centroid ~ comment_age +
+  lmer(discrimination_centroid ~ comment_age +
          (1|submission_id) + (1|author), 
        data = ., REML = FALSE,
        control = lmerControl(optimizer ="Nelder_Mead")
        )
 
 # step 3: Author and submission level variables ----
-m3 <- comments %>% 
-  lmer(sexism_centroid ~ comment_age +
-         politics_comments + user_comments +
-         thread_age +
-         vote_average + vote_count + sexism_keywords + 
-         MeToo +  
+m3 <- comments %>%
+  lmer(discrimination_centroid ~ 
+         thread_age + `thread_age^2` +
+         comment_age +
+         politics_comments + 
+         MeToo + BLM + OscarsSoWhite +
+         sexism_keywords + racism_keywords +
          (1|submission_id) + (1|author), 
        data = ., REML = FALSE,
        control = lmerControl(optimizer ="Nelder_Mead")
        )
 
-# paste(genres, collapse = " + ")
-m3b <- comments %>% 
-  lmer(sexism_centroid ~ years + 
-         politics_comments + vote_average + vote_count +
+m3a <- comments %>%
+  lmer(discrimination_centroid ~ 
+         thread_age +
+         (1|submission_id) + (1|author), 
+       data = ., REML = FALSE,
+       control = lmerControl(optimizer ="Nelder_Mead")
+       )
+
+m3b <- comments %>%
+  lmer(discrimination_centroid ~ 
+         thread_age + `thread_age^2` +
+         (1|submission_id) + (1|author), 
+       data = ., REML = FALSE,
+       control = lmerControl(optimizer ="Nelder_Mead")
+       )
+
+anova(m3a, m3b)
+
+m3c <- comments %>%
+  lmer(discrimination_centroid ~ 
+         thread_age + `thread_age^2` +
+         # comment_age +
+         # politics_comments + 
+         # MeToo + BLM + OscarsSoWhite +
          sexism_keywords + racism_keywords +
-         MeToo +
+         (1|submission_id) + (1|author), 
+       data = ., REML = FALSE,
+       control = lmerControl(optimizer ="Nelder_Mead")
+       )
+
+# paste(genres, collapse = " + ") ----
+m3f <- comments %>% 
+  mutate("thread_age^2" = thread_age^2) %>% 
+  lmer(discrimination_centroid ~ comment_age +
+         politics_comments + movies_comments +
+         `thread_age^2` +
+         thread_age * vote_count +
+         vote_average + 
+         sexism_keywords + racism_keywords +
+         MeToo + BLM + OscarsSoWhite +
          `Science Fiction` + Action + Adventure + Fantasy + Crime + Thriller + Drama + Comedy + 
          Horror + Mystery + War + Animation + Family + History + Western + Romance + Music + 
          `TV Movie` + Documentary +
@@ -273,48 +377,47 @@ m3b <- comments %>%
        )
 
 # step 4: Random slope ----
-m4 <- comments %>% 
-  lmer(sexism_centroid ~ years + 
-         politics_comments + vote_average + vote_count + sexism_keywords + 
-         MeToo + 
-         (1|submission_id) + (1+years|author), 
+m4 <- comments %>%
+  lmer(discrimination_centroid ~ 
+         thread_age + `thread_age^2` +
+         comment_age +
+         politics_comments + 
+         MeToo + BLM + OscarsSoWhite +
+         sexism_keywords + racism_keywords +
+         (1|submission_id) + (1+thread_age|author), 
        data = ., REML = FALSE,
        control = lmerControl(optimizer ="Nelder_Mead")
        )
 
 # step 5: cross-level interactions ----
-m5a <- comments %>% 
-  lmer(sexism_centroid ~ years * MeToo +
-         politics_comments + vote_average + vote_count + sexism_keywords + 
-         (1|submission_id) + (1+years|author), 
+m5 <- comments %>%
+  lmer(discrimination_centroid ~ 
+         (thread_age + `thread_age^2`) * politics_comments +
+         comment_age +
+         MeToo + BLM + OscarsSoWhite +
+         sexism_keywords + racism_keywords +
+         (1|submission_id) + (1+thread_age|author), 
        data = ., REML = FALSE,
        control = lmerControl(optimizer ="Nelder_Mead")
        )
 
-m5b <- comments %>% 
-  lmer(sexism_centroid ~ years * sexism_keywords +
-         politics_comments + vote_average + vote_count + MeToo + 
-         (1|submission_id) + (1+years|author), 
+m5a <- comments %>%
+  lmer(discrimination_centroid ~ 
+         thread_age * politics_comments + `thread_age^2` + 
+         comment_age +
+         MeToo + BLM + OscarsSoWhite +
+         sexism_keywords + racism_keywords +
+         (1|submission_id) + (1+thread_age|author), 
        data = ., REML = FALSE,
        control = lmerControl(optimizer ="Nelder_Mead")
        )
 
-m5c <- comments %>% 
-  lmer(sexism_centroid ~ years * politics_comments +
-         vote_average + vote_count + sexism_keywords + 
-         MeToo +
-         (1|submission_id) + (1+years|author), 
-       data = ., REML = FALSE,
-       control = lmerControl(optimizer ="Nelder_Mead")
-       )
-
+anova(m4, m5a, m5)
 # Output ----
-stargazer(m1, m2, m3c, type = "text")
-get_models(m1, m2, m3, m4, out = "latex")
+stargazer(m1, m3b, m3, m4, m5, type = "text")
+get_models(m1, m3b, m3, m4, m5)
 
-get_models(m2, m3, m3b, m3c)
-
-anova(m1, m2, m3, m4)
+anova(m1, m2, m3b, m3, m4)
 
 summary(m1)
 get_fixed(m1)
@@ -322,76 +425,267 @@ get_random(m1)
 get_sum(m1)
 # viz ----
 # should use ranef() instead to get condVar, but its extremely slow
-
-submissions <- comments %>% 
-  arrange(Date) %>% 
-  group_by(submission_id) %>% 
-  slice_head(n=1) %>% 
-  ungroup() %>% 
-  select(!all_of(c("comment_id", "author", "score", "politics_comments"))) %>% 
-  select(!ends_with("centroid")) %>% 
-  select(!ends_with("_cmd"))
-
 pred_values <- submissions %>% 
-  left_join(predict_submission(m1)) %>% 
-  left_join(predict_submission(m2)) %>% 
-  left_join(predict_submission(m3c))
+  predict_submission(m1) %>% 
+  predict_submission(m3a) %>% 
+  predict_submission(m3) %>% 
+  predict_submission(m4)
 
 pred_values %>% 
   reshape2::melt(
-    measure.vars = c("m1", "m2", "m2e", "m3c"),
+    measure.vars = c("m1", "m3a", "m3", "m4"),
     variable.name = "Model",
     value.name = "Ranef"
     ) %>% 
   as_tibble() %>% 
-  ggplot(aes(Date, Ranef, color = Model, fill = Model)) +
-  geom_smooth(method="loess", se=F)
+  ggplot(aes(thread_date, Ranef, color = Model)) +
+  geom_smooth(method = "loess", se = F)
 
-pred_values %>% 
-  # mutate(label = if_else(fit3c > 1 | fit3c < -.45, film_title, NA_character_)) %>% 
-  ggplot(aes(Date, fit3c, label=label)) +
-  # geom_point(alpha=.1) +
-  geom_smooth(method = "lm", se=F, color="red") +
-  # geom_smooth(method = "lm", formula = "y ~ poly(x, 2)", se=F, color="yellow") +
-  # geom_smooth(method = "lm", formula = "y ~ poly(x, 5)", se=F, color="purple") +
-  # geom_text(na.rm = T)
+```
+```{r other data}
+# Monthly Tweets ----
+tweets <- read_csv(tweets_file)
 
-pred_values %>% 
-  mutate(x = sexism_centroid - fit3b) %>% 
-  arrange(x)
-
-pred_values %>% 
+plot_monthly_tweets <- tweets %>% 
+  filter(Date >= min_date,
+         Date < max_date) %>% 
+  group_by(Date = floor_date(Date, "month")) %>% 
+  summarise(across(all_of(movements), sum)) %>% 
+  reshape2::melt(id.vars="Date", variable.name = "Movement", value.name = "Tweets") %>%
+  mutate(Movement = as.character(Movement)) %>% 
+  arrange(Movement) %>% 
   mutate(label = case_when(
-    abs(Date - date_metoo) == min(abs(Date - date_metoo)) ~ "Alyssa Milano\nTweet",
-    T ~ NA_character_)) %>% 
-  group_by(label) %>% 
-  mutate(label = if_else(!duplicated(label), label, NA_character_)) %>% 
-  ungroup() %>% 
-  ggplot(aes(Date, fit, label=label)) +
-  # geom_line(aes(y=value, color = "Actual Means")) +
-  # geom_smooth(aes(y=value, color = "Loess Smoothed Actual Means"), method = "loess",se=F) +
-  geom_point(aes(color = "Predicted Means")) +
-  # geom_smooth(aes(color = "Loess Smoothed Predicted Means"), method = "loess", se=F) +
-  geom_vline(xintercept = as.numeric(date_metoo), linetype=2) +
-  # scale_y_continuous(limits = c(0.025, 0.025)) +
+    (Date == floor_date(date_metoo, "month")) & (Movement == "MeToo") ~ "Alyssa Milano\nTweet",
+    (Date == floor_date(date_floyd, "month")) & (Movement == "BLM") ~ "George Floyd Protests",
+    (Date == floor_date(date_reign, "month")) & (Movement == "OscarsSoWhite") ~ "April Reign\nTweet",
+    #(Date == min(Date)) & (Movement == "MeToo") ~ "#MeToo",
+    #(Date == min(Date)) & (Movement == "BLM") ~ "#BLM",
+    #(Date == min(Date)) & (Movement == "OscarsSoWhite") ~ "#OscarsSoWhite",
+    T ~ NA_character_
+  )) %>% 
+  mutate(Movement = if_else(Movement == "BLM", "BlackLivesMatter", Movement),
+         Movement = str_c("#", Movement)) %>%
+  ggplot(aes(Date, Tweets, color=Movement, linetype=Movement, label=label)) +
+  geom_line(size=2) +
   scale_x_date(date_breaks = "2 months", date_labels = "%b '%y",
                expand = expansion(mult = c(0, 0))) +
-  scale_color_manual(values = lm_colors) +
-  # ggrepel::geom_text_repel(color="black",
-  #                          na.rm=T, show.legend = F,
-  #                          # direction = "y", 
-  #                          nudge_y = .05,
-  #                          min.segment.length = Inf
-  # ) +
-  annotate("text", date_metoo, 0.075, label="Alyssa Milano Tweet", angle=90, vjust=-.3) +
+  scale_y_log10(
+                limits = c(10,10^8),
+                breaks = scales::log_breaks(8),
+                labels = scales::comma,
+                expand = expansion(mult = c(0, 0.02))
+                ) +
+  ggrepel::geom_text_repel(color="black",
+                           na.rm=T, show.legend = F,
+                         direction = "y", nudge_y = .01
+           ) +
+  #scale_color_brewer(palette = "Set3") +
+  scale_color_manual(values=tweets_color_scale) +
+  scale_linetype_manual(values=tweets_lines_scale) +
   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
-        legend.position = "top",
-        legend.title = element_blank()) +
-  labs(title = "Mean Predicted Values of Sexism-Related Comments Grouped by Submission",
-       # subtitle = "Formula: CMD from sexism ~ log( #MeToo tweets) * cumulative frequency of #MeToo tweets",
-       x = element_blank(),
-       y = "CMD from Sexism Centroid")
+        legend.position = "top") +
+  labs(
+    color = "Movement:",
+    linetype = "Movement:",
+    y = "Tweets",
+    x = element_blank()
+    #title = "Social Movements' Tweets per Month"
+  ) +
+  guides(
+    linetype=guide_legend(keywidth = 1.8, keyheight = 1),
+    color=guide_legend(keywidth = 1.8, keyheight = 1))
+
+plot_monthly_tweets
+
+# disc per submission ----
+submissions <- comments %>% 
+  group_by(submission_id, film_title) %>% 
+  summarise(
+    mean = mean(discrimination_centroid),
+    thread_date = min(thread_date),
+    thread_age = min(thread_age),
+    racism_keywords = min(racism_keywords),
+    sexism_keywords = min(sexism_keywords),
+    n_comments = n()
+  )
+
+plot_disc_mean <- submissions %>% 
+  mutate(Keywords = case_when(
+    racism_keywords == 0 & sexism_keywords == 0 ~ "Neither",
+    racism_keywords == 1 & sexism_keywords == 0 ~ "Racism",
+    racism_keywords == 0 & sexism_keywords == 1 ~ "Sexism",
+    racism_keywords == 1 & sexism_keywords == 1 ~ "Both",
+    T ~ NA_character_
+  ),
+  label = if_else(mean > 1 | mean < -0.5, film_title, NA_character_)
+  ) %>% 
+  arrange(match(Keywords, c("Neither", "Racism", "Sexism", "Both"))) %>% 
+  ggplot(aes(thread_date, mean, 
+             color = fct_inorder(Keywords), shape = fct_inorder(Keywords),
+             label = label
+  )) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(color="black",
+                           na.rm=T, show.legend = F,
+                           # direction = "y", nudge_y = .01
+  ) +
+  scale_color_viridis_d(direction = -1) +
+  scale_x_date(breaks = seq(from = min_date, to = max_date, by = "2 months"),
+               date_labels = "%b '%y",
+               expand = expansion(mult = c(0.005, 0.005))
+               ) +
+  labs(
+    x = element_blank(),
+    y = "Mean Discrimination Centroid",
+    color = "Keywords:",
+    shape = "Keywords:",
+  ) +
+  theme(legend.position = "top",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+plot_disc_mean
+
+# tmdb ----
+tmdb %>%
+  filter(date >= min_date,
+         date < max_date) %>% 
+  mutate(across(ends_with("_keywords"), ~ if_else(.x > 0, 1, 0)),
+         date = date(date)
+         ) %>% 
+  rename_with(.fn = ~ str_to_title(str_remove(.x, "_keywords"))) %>% 
+  reshape2::melt(id.vars="Date", measure.vars = c("Sexism", "Racism"), variable.name = "Disc", value.name = "Keyword") %>%
+  # group_by(Date = floor_date(Date, unit = "month"), Disc) %>% 
+  # summarise(Keyword = mean(Keyword)) %>% 
+  ggplot(aes(Date, Keyword, color=Disc, fill=Disc)) +
+  geom_smooth(method = "loess", alpha=.2) +
+  scale_x_date(date_breaks = "2 months", date_labels = "%b '%y",
+               expand = expansion(mult = c(0, 0))) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, 0))) +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  scale_linetype_manual(values=c("sold", "1111")) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        legend.position = "top") +
+  labs(
+    color = element_blank(),
+    fill = element_blank(),
+    linetype = element_blank(),
+    y = "Film Has Keyword",
+    x = element_blank()
+    #title = "Social Movements' Tweets per Month"
+  ) +
+  guides(
+    linetype=guide_legend(keywidth = 1.8, keyheight = 1),
+    color=guide_legend(keywidth = 1.8, keyheight = 1))
 ```
+```{r exporting}
+save_plot(plot_monthly_tweets, "monthly_tweets.pdf")
+save_plot(plot_concept, "concept_correlations.pdf", 8, 6)
+save_plot(plot_correlations, "correlations.pdf", 8, 6)
+save_plot(plot_disc_mean, "thread_discrimination.pdf")
+
+get_models(m1, m3b, m3, m4, m5, model_names = c("m1", "m3b", "m3","m4", "m5"), latex = T, filename = "multilevel")
+
+anova(m1, m3a, m3b, m3, m4, m5) %>% 
+  xtable(
+        caption = "Likelihood-Ratio Test for Model Improvement over Previous Model",
+        label = "tab:Anova",
+        digits = c(rep(0, ncol(.)), 3),
+        align = c("l", rep("C", ncol(.)))
+      ) %>% 
+      print(
+        table.placement = "htb",
+        caption.placement = "top",
+        latex.environments = "threeparttable",
+        tabular.environment = "tabular",
+        # include.rownames = F,
+        #math.style.negative = T,
+        print.results = F,
+        booktabs = T,
+        # width = "\\linewidth",
+        comment = F,
+        size = "\\sisetup{parse-numbers= false, mode=text}"
+      ) %>% 
+  # str_replace("Pr\\(\\$\\>\\$Chisq\\)", "{p}") %>% 
+  # str_replace_all("Chisq", "$\\\\chi^2$") %>%
+  str_replace("& npar & AIC & BIC & logLik & deviance & Chisq & Df & Pr\\(\\$\\>\\$Chisq\\)",
+              "& {npar} & {AIC} & {BIC} & {logLik} & {deviance} & {$\\\\chi^2$} & {Df} & {p}") %>% 
+  str_replace_all("0\\.000", "<.001") %>% 
+  str_replace_all("0\\.", ".") %>% 
+  str_replace("C{3,999}", " @{ }S[table-format=2.0]@{ } *{4}{@{ }S[table-format=-7.0]@{ }} @{ }S[table-format=4.0]@{ } @{ }S[table-format=2.0]@{ } @{ }S[table-format=<.3]@{ }"
+              ) %>% 
+  # cat()
+  write(., "output/anova.tex")
+
+comments %>% 
+  select(ends_with("_cmd") | ends_with("_centroid")) %>%
+  colnames() %>% 
+  as_tibble_col(column_name = "Concept") %>% 
+  mutate(Words = case_when(
+    endsWith(Concept, "_cmd") ~ str_replace(Concept, "_cmd", ""),
+    startsWith(Concept, "sexism") ~ toString(sexism_words),
+    startsWith(Concept, "racism") ~ toString(racism_words),
+    startsWith(Concept, "discrimination") ~ toString(discrimination_words),
+    T ~ NA_character_
+  ),
+  Concept = str_to_title(str_replace(Concept, "_", " ")),
+  Concept = str_replace(Concept, "Cmd", "CMD")
+  ) %>% 
+  xtable(
+        caption = "Words Used for Concept Mover's Distance (CMD)",
+        label = "tab:CmdConcept",
+        align = c(rep("l", 2), rep("L", ncol(.)-1)),
+        #display = c("s", "s", rep("f", ncol(.)-1))
+      ) %>% 
+      print(
+        table.placement = "htb",
+        caption.placement = "top",
+        # latex.environments = "threeparttable",
+        latex.environments = NULL,
+        tabular.environment = "tabulary",
+        include.rownames = F,
+        #math.style.negative = T,
+        print.results = F,
+        booktabs = T,
+        width = "\\linewidth",
+        comment = F,
+        # size = "\\sisetup{parse-numbers= false, mode=text}",
+        #add.to.row = list(pos=list(0), command=c("gu"))
+      ) %>% 
+  write(., "output/concept_words.tex")
+
+comments %>% 
+  select(var_selection) %>% 
+  st(out="return",
+     summ=c("mean(x)", "sd(x)", "min(x)", "max(x)"),
+     digits = 2, fixed.digits = F,
+     ) %>% 
+  as_tibble() %>% 
+  xtable(
+        caption = "Descriptive Statistics",
+        label = "tab:DescStat",
+        align = c(rep("l", 2), rep("C", ncol(.)-1))
+      ) %>% 
+      print(
+        table.placement = "htb",
+        caption.placement = "top",
+        latex.environments = "threeparttable",
+        tabular.environment = "tabular",
+        include.rownames = F,
+        #math.style.negative = T,
+        print.results = F,
+        booktabs = T,
+        # width = "\\linewidth",
+        comment = F,
+        size = "\\sisetup{parse-numbers= false, mode=text}"
+      ) %>% 
+  str_replace(., "C{3,999}", str_c(" *{", str_length(str_extract(., "C{3,999}")), "}{@{ }S[table-format=-1.2]@{ }}")) %>%
+  str_replace("Variable & Mean & Sd & Min & Max", " & {Mean} & {S.D.} & {Min} & {Max}") %>% 
+  write(., "output/desc_stats.tex")
+  # cat()
+```
+
 
 ```{r graveyard} 
 # functions ----
@@ -451,7 +745,7 @@ comments <- comments %>%
 comments %>%
   select(date, submission_id) %>% 
   group_by(submission_id) %>% 
-  summarise(days_since_sub = median(date-min(date))) %>% 
+  summarise(days_since_sub = median(date - date_crea )) %>% 
   filter(days_since_sub < 30) %>% 
   ggplot(aes(days_since_sub)) +
   stat_ecdf() +
@@ -684,4 +978,74 @@ map(c(m1,m2),
   # str_replace_all("[-\d\.]+")
   str_replace_all("\\\\", "\\\\\\\\") %>% 
   cat()
+# Vote count over time ----
+# There seems to be a drop in n of votes due to covid (at the top end)
+# Other potential reasons: 
+# there has been less chance for voting on more recent films
+# more recent films are more likely to have discussion threads, even if they are less popular (bottom end)
+
+comments %>% 
+  group_by(submission_id) %>% 
+  summarise(Date = min(Date), vote_count = min(vote_count)) %>% 
+  ggplot(aes(Date, vote_count)) + 
+  geom_point() + 
+  geom_smooth(method=lm) + 
+  geom_vline(xintercept = ymd("2020-03-01"))
+
+comments %>%
+  mutate(pop = cut_number(vote_count, 3)) %>% 
+  ggplot(aes(thread_date, discrimination_centroid)) +
+  geom_smooth(method = "lm", linetype = 2) +
+  geom_smooth(aes( color = pop, fill = pop), method = "lm") +
+  theme(legend.position = "top") +
+  labs(
+    title = "Vote count into\n5 groups with equal n(obs)",
+    color = element_blank(),
+    fill = element_blank()
+  )
+
+
+comments %>% 
+  group_by(submission_id) %>% 
+  slice_head(n=1) %>% 
+  ungroup() %>% 
+  ggplot(aes(thread_age, sexism_keywords)) +
+  geom_smooth(color="red", fill="red", method = "lm") +
+  geom_smooth(aes(y=racism_keywords), color="blue", fill="blue", method = "lm")
+# ranef ----
+pred_values %>% 
+  mutate(x = discrimination_centroid - fit3b) %>% 
+  arrange(x)
+
+pred_values %>% 
+  mutate(label = case_when(
+    abs(Date - date_metoo) == min(abs(Date - date_metoo)) ~ "Alyssa Milano\nTweet",
+    T ~ NA_character_)) %>% 
+  group_by(label) %>% 
+  mutate(label = if_else(!duplicated(label), label, NA_character_)) %>% 
+  ungroup() %>% 
+  ggplot(aes(Date, m3, label=label)) +
+  # geom_line(aes(y=value, color = "Actual Means")) +
+  # geom_smooth(aes(y=value, color = "Loess Smoothed Actual Means"), method = "loess",se=F) +
+  geom_point(aes(color = "Predicted Means")) +
+  # geom_smooth(aes(color = "Loess Smoothed Predicted Means"), method = "loess", se=F) +
+  geom_vline(xintercept = as.numeric(date_metoo), linetype=2) +
+  # scale_y_continuous(limits = c(0.025, 0.025)) +
+  scale_x_date(date_breaks = "2 months", date_labels = "%b '%y",
+               expand = expansion(mult = c(0, 0))) +
+  # scale_color_manual(values = lm_colors) +
+  # ggrepel::geom_text_repel(color="black",
+  #                          na.rm=T, show.legend = F,
+  #                          # direction = "y", 
+  #                          nudge_y = .05,
+  #                          min.segment.length = Inf
+  # ) +
+  annotate("text", date_metoo, 0.075, label="Alyssa Milano Tweet", angle=90, vjust=-.3) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        legend.position = "top",
+        legend.title = element_blank()) +
+  labs(title = "Mean Predicted Values of Sexism-Related Comments Grouped by Submission",
+       # subtitle = "Formula: CMD from sexism ~ log( #MeToo tweets) * cumulative frequency of #MeToo tweets",
+       x = element_blank(),
+       y = "CMD from Sexism Centroid")
 ```
