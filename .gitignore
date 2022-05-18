@@ -8,6 +8,7 @@ __pycache__
 Thesis.Rproj
 output/
 models/
+figures/
 !data/
 data/*
 
