@@ -1,7 +1,7 @@
 ---
-title: "CMD"
+title: "Analysis"
 author: "Jarik Stam"
-date: "4-3-2022"
+date: "`r Sys.Date()`"
 output: html_document
 editor_options: 
   chunk_output_type: console
@@ -19,22 +19,18 @@ library(xtable)
 library(stargazer)
 library(ggcorrplot)
 library(vtable)
+library(reticulate)
 
 theme_set(cowplot::theme_minimal_hgrid())
 Sys.setlocale("LC_TIME", "English")
 ```
-```{r files}
-analysis_file <- "data/comments_analysis_v3.csv"
-tmdb_file <- "data/submissions_tmdb.csv"
-tweets_file <- "data/keywords_daily_count.csv"
-
+```{python filenames}
+from params import analysis_dataset, submissions_tmdb_file, count_file, binary_wv_file, wvdf_file, embedding_results_file
+```
+```{r params}
 figures_path <- "figures"
 output_path <- "output"
 
-binary_wv_file <- "./models/gensim_model_window25_vector300_kv.w2v"
-wvdf_file <- "data/wvdf.csv"
-```
-```{r params}
 min_date <- ymd("2013-05-01")
 max_date <- ymd("2022-02-01")
 date_metoo <- ymd("2017-10-15")
@@ -92,7 +88,7 @@ save_plot <- function(plot, filename, width=10, height=6) {
 # Filtering comments ----
 # AutoModerator is a bot used by Reddit moderators for automized moderation
 # [deleted] and None are unknown authors (mostly) because of deleted accounts whose comments remain, meaning I can't test for within-author change
-comments <- fread(analysis_file, data.table = FALSE)
+comments <- fread(py$analysis_dataset, data.table = FALSE)
 
 comments <- comments %>%
   as_tibble() %>% 
@@ -152,9 +148,9 @@ comments <- comments %>%
     )
 
 # Other data ----
-# model <- read.word2vec(file = binary_wv_file, normalize = TRUE)
+# model <- read.word2vec(file = py$binary_wv_file, normalize = TRUE)
 
-tmdb <- read_delim(tmdb_file, delim = ";")
+tmdb <- read_delim(py$submissions_tmdb_file, delim = ";")
 genres <- tmdb %>% select(`Science Fiction`:Documentary) %>% colnames()
 
 comments <- tmdb %>% 
@@ -165,7 +161,7 @@ comments <- tmdb %>%
 # https://cran.r-project.org/web/packages/text2map/vignettes/CMDist-concept-movers-distance.html
 # Options: single words, compound words, semantic directions, centroids.
 
-wv <- read_csv(wvdf_file) %>% 
+wv <- read_csv(py$wvdf_file) %>% 
   column_to_rownames("...1") %>% 
   data.matrix(rownames.force = TRUE)
 
@@ -444,7 +440,7 @@ pred_values %>%
 ```
 ```{r other data}
 # Monthly Tweets ----
-tweets <- read_csv(tweets_file)
+tweets <- read_csv(py$count_file)
 
 plot_monthly_tweets <- tweets %>% 
   filter(Date >= min_date,
@@ -580,11 +576,13 @@ tmdb %>%
     color=guide_legend(keywidth = 1.8, keyheight = 1))
 ```
 ```{r exporting}
+# figures ----
 save_plot(plot_monthly_tweets, "monthly_tweets.pdf")
 save_plot(plot_concept, "concept_correlations.pdf", 8, 6)
 save_plot(plot_correlations, "correlations.pdf", 8, 6)
 save_plot(plot_disc_mean, "thread_discrimination.pdf")
 
+# results ----
 get_models(m1, m3b, m3, m4, m5, model_names = c("m1", "m3b", "m3","m4", "m5"), latex = T, filename = "multilevel")
 
 anova(m1, m3a, m3b, m3, m4, m5) %>% 
@@ -616,8 +614,9 @@ anova(m1, m3a, m3b, m3, m4, m5) %>%
   str_replace("C{3,999}", " @{ }S[table-format=2.0]@{ } *{4}{@{ }S[table-format=-7.0]@{ }} @{ }S[table-format=4.0]@{ } @{ }S[table-format=2.0]@{ } @{ }S[table-format=<.3]@{ }"
               ) %>% 
   # cat()
-  write(., "output/anova.tex")
+  write(., paste0(output_path, "/anova.tex"))
 
+# other tables ----
 comments %>% 
   select(ends_with("_cmd") | ends_with("_centroid")) %>%
   colnames() %>% 
@@ -653,7 +652,7 @@ comments %>%
         # size = "\\sisetup{parse-numbers= false, mode=text}",
         #add.to.row = list(pos=list(0), command=c("gu"))
       ) %>% 
-  write(., "output/concept_words.tex")
+  write(., paste0(output_path, "/concept_words.tex"))
 
 comments %>% 
   select(var_selection) %>% 
@@ -682,11 +681,36 @@ comments %>%
       ) %>% 
   str_replace(., "C{3,999}", str_c(" *{", str_length(str_extract(., "C{3,999}")), "}{@{ }S[table-format=-1.2]@{ }}")) %>%
   str_replace("Variable & Mean & Sd & Min & Max", " & {Mean} & {S.D.} & {Min} & {Max}") %>% 
-  write(., "output/desc_stats.tex")
+  write(., paste0(output_path, "/desc_stats.tex"))
   # cat()
+
+read_csv(py$embedding_results_file) %>% 
+  select(!Wordsim) %>% 
+  rename("Wordsim" = "Sp_corr") %>%
+  xtable::xtable(
+    caption = "Word Embedding Model Comparison",
+    label = "Embedding",
+    align = rep("C", ncol(.)+1),
+    digits = c(0,0,0,3,3)
+  ) %>% 
+  print(
+    table.placement = "tb",
+    caption.placement = "top",
+    latex.environments = "threeparttable",
+    tabular.environment = "tabulary",
+    include.rownames = F,
+    #math.style.negative = T,
+    print.results = F,
+    booktabs = T,
+    width = "\\linewidth",
+    comment = F
+  ) %>% 
+  str_replace(., "Google", "\\\\% Correct Google Analogies\\\\tnote{a}") %>% 
+  str_replace(., "Wordsim", "WordSim-353 Spearman's $\\\\rho$\\\\tnote{b}") %>% 
+  str_replace(., "25 & 300 & 0.459 & 0.568", "\\\\textbf{25} & \\\\textbf{300} & \\\\textbf{0.459} & \\\\textbf{0.568}") %>% 
+  str_replace(., "end\\{tabulary\\}", "end{tabulary}\n\\\\begin{tablenotes}\n\\\\item \\\\textit{Note.} Model trained using Gensim's Word2Vec. Chosen model in bold.\n\\\\item [a] Google Analogy Test \\\\parencite{Mikolov2013}.\n\\\\item [b] WordSimilarity-353 \\\\parencite{Finkelstein2001}.\n\\\\end{tablenotes}") %>% 
+  write(., paste0(output_path, "/embeddingResults.tex"))
 ```
-
-
 ```{r graveyard} 
 # functions ----
 
