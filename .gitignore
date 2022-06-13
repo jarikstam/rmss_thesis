@@ -3,7 +3,7 @@ twitter_keys.py
 .ipynb_checkpoints
 __pycache__
 .Rproj.user
-.RData
+*.RData
 .RHistory
 Thesis.Rproj
 output/

@@ -7,6 +7,7 @@ editor_options:
   chunk_output_type: console
 ---
 ```{r setup}
+library(reticulate)
 library(word2vec)
 library(text2map)
 library(Matrix)
@@ -14,12 +15,12 @@ library(data.table)
 library(tidyverse)
 library(lubridate)
 library(lme4)
-library(optimx)
+# library(robustlmm)
 library(xtable)
 library(stargazer)
 library(ggcorrplot)
+library(lattice)
 library(vtable)
-library(reticulate)
 
 theme_set(cowplot::theme_minimal_hgrid())
 Sys.setlocale("LC_TIME", "English")
@@ -53,19 +54,6 @@ names(tweets_lines_scale) <- hashtag_names
 
 ```
 ```{r functions}
-se <- function(x) sd(x)/sqrt(length(x))
-
-predict_submission <- function(.data, model) {
-  model_name <- deparse(substitute(model))
-  df <- ranef(model, condVar=F, whichel="submission_id") %>% 
-    as_tibble() %>% 
-    mutate({{ model_name }} := condval #+ fixef(model)[1]
-           ) %>% 
-    select(grp, {{ model_name }}) %>% 
-    rename("submission_id" = grp)
-    left_join(.data, df)
-}
-
 plot_corr <- function(.data) {
   .data %>% 
     cor() %>% 
@@ -81,6 +69,164 @@ save_plot <- function(plot, filename, width=10, height=6) {
          width = width, height = height, units = "in", dpi = 1200)
   
   knitr::plot_crop(paste0(figures_path, "/", filename))
+}
+
+get_fixed <- function(model) {
+  summary(model)["coefficients"][[1]] %>% 
+    as_tibble(rownames = "Variable") %>% 
+    rename("Coef." = Estimate,
+           "S.E." = `Std. Error`,
+           "T" = `t value`)
+}
+
+get_random <- function(model) {
+  VarCorr(model) %>% 
+    as_tibble() %>%
+    select(!c(sdcor))
+}
+
+get_ll <- function(model) {
+  logLik(model)[1]
+}
+
+get_models <- function(..., model_names=NULL, latex=F, filename=NULL, landscape=T) {
+  
+  if(length(list(...)) == 1) {
+    
+    df <- get_fixed(...)
+    rdf <- get_random(...)
+    ll <- get_ll(...)
+    
+  } else {
+    
+    df <- list(...) %>% 
+      map(get_fixed) %>% 
+      bind_rows(.id = "Model") %>%
+      pivot_wider(
+        names_from = "Model",
+        values_from = 3:5,
+        names_glue = "{Model}_{.value}"
+      ) %>% 
+      select(order(colnames(.))) %>%
+      select(Variable, everything())
+    
+    rdf <- list(...) %>% 
+      map(get_random) %>%
+      bind_rows(.id = "Model") %>% 
+      { if(latex) mutate(., zzy = NA, zzz = NA) else . } %>% 
+      pivot_wider(
+        names_from = "Model",
+        values_from = 5:ncol(.),
+        names_glue = "{Model}_{.value}"
+      ) %>% 
+      select(order(colnames(.))) %>%
+      mutate(
+        randomname = case_when(
+          grp == "author" & var1 == "(Intercept)" & is.na(var2) ~ "sigsqhereInt/Commenter",
+          grp == "author" & var1 != "(Intercept)" ~ str_c("sigsqhere", var1, "/Commenter"),
+          grp == "author" & var1 == "(Intercept)" & !is.na(var2) ~ str_c("sigmahereInt:", var2, "/Commenter"),
+          grp == "submission_id" & var1  == "(Intercept)" & is.na(var2) ~ "sigsqhereInt/Film Discussion",
+          grp == "submission_id" & var1 != "(Intercept)" ~ str_c("sigsqhere", var1, "/Film Discussion"),
+          grp == "submission_id" & var1 == "(Intercept)" & !is.na(var2) ~ str_c("sigmahereInt:", var2, "/Film Discussion"),
+          grp == "Residual" ~ "sigsqhereInt/Comment",
+          T ~ "grp names have changed"
+        )
+      ) %>% 
+      mutate(across(where(is.character), ~ replace_na(.x, ""))) %>% 
+      arrange(var2, var1, match(grp, c("Residual", "author", "submission_id"))) %>% 
+      select(!all_of(c("grp", "var2", "var1"))) %>% 
+      select(randomname, everything())
+    
+    ll <- list(...) %>% 
+      map(get_ll)
+  }
+  if(latex){
+    
+    random <- rdf %>%
+      xtable(digits = 3) %>% 
+      print(
+        include.rownames = F,
+        include.colnames = F,
+        print.results = F,
+        booktabs = T,
+        comment = F,
+        only.contents = T
+      ) %>% 
+      str_replace_all("\\\\", "\\\\\\\\")
+    
+    nr_cols <- (ncol(df)-1)/3
+    
+    fixed <- df %>% 
+      xtable(
+        caption = "Random Effects Model for Discrimination Concept Engagement in Film Discusssion Comments",
+        label = "Multilevel",
+        digits = c(0, 0, rep(c(3, 2, 2), nr_cols)),
+        align = c(rep("l", 2), rep("C", ncol(.)-1)),
+      ) %>% 
+      print(
+        table.placement = "tb",
+        caption.placement = "top",
+        latex.environments = "threeparttable",
+        tabular.environment = "tabular*",
+        include.rownames = F,
+        #math.style.negative = T,
+        print.results = F,
+        booktabs = T,
+        width = "\\linewidth",
+        comment = F,
+        size = "\\sisetup{parse-numbers= false, mode=text}",
+      ) %>% 
+      str_replace(., "(?<=)toprule", str_replace_all(str_c("toprule\n", 
+                                                           if_else(!is.null(model_names), 
+                                                                   toString(map(model_names,
+                                                                                ~ str_c(" & \\\\multicolumn{3}{c}{", 
+                                                                                        .x, "}"))),
+                                                                   toString(map(1:nr_cols,
+                                                                        ~ str_c(" & \\\\multicolumn{3}{c}{Model ", 
+                                                                                as.character(.x), "}")))),
+                                                           
+                                                           " \\\\\\\\\n",
+                                                           toString(map(
+                                                             1:nr_cols, ~ str_c("\\\\cmidrule(lr){", as.character(.x*2+.x-1), "-", as.character(.x*2+.x+1), "}"))),
+                                                           "\n\\\\multicolumn{2}{l}{Fixed Effects} \\\\\\\\\n\\\\midrule"
+      ),
+      ", ", ""
+      )
+      ) %>% 
+      str_replace(., "C{3,999}", str_c(" @{\\\\extracolsep{\\\\fill}} *{", str_length(str_extract(., "C{3,999}")), "}{@{}S[table-format=-1.3]@{}}")) %>% 
+      str_replace_all("\\S*\\\\_Coef.", "{ Coef.}") %>%
+      str_replace_all("\\S*\\\\_S.E.", "{ S.E.}") %>%
+      str_replace_all("\\S*\\\\_T", "{ T}") %>%
+      str_replace("(?<=)\\\\bottomrule\n",
+                  str_c("\\\\midrule\n\\\\multicolumn{2}{l}{Random Effects} \\\\\\\\\n", random)) %>% 
+      str_replace_all("\\\\verb\\|\\^\\|2", "$^{2}$") %>%
+      str_replace_all("thread\\\\_age", "Film\\\\ Discussion\\\\ Creation") %>%
+      str_replace_all("comment\\\\_age", "Comment Creation") %>%
+      str_replace_all("politics\\\\_comments", "Politics Comments") %>%
+      str_replace_all("sexism\\\\_keywords", "Sexism Keyword") %>%
+      str_replace_all("racism\\\\_keywords", "Racism Keyword") %>%
+      str_replace_all("(MeToo|BLM|OscarsSoWhite)", "\\\\#\\1 Tweets") %>%
+      str_replace_all("Film Discussion", "Film\\\\ Discsussion") %>%
+      str_replace_all("`", "") %>%
+      str_replace_all("sigsqhere(.*?)(?= &)", "$\\\\sigma^{2}_{\\1}$") %>% 
+      str_replace_all("sigmahere(.*?)(?= &)", "$\\\\sigma_{\\1}$") %>% 
+      str_replace_all(":", "\\\\ X\\\\ ") %>%
+      str_replace_all("X\\\\ Politics Comments", "X\\\\ Pol. Com.") %>% 
+      str_replace("\\\\endgroup", "\\\\endgroup\n\\\\fnote{\\\\textit{Note.} N(comments) = 1,121,391. N(film discussions) = 1129. N(commenters) = 90,668.}"
+              ) %>% 
+      { if_else(landscape, str_c("\\begin{landscape}\n", ., "\\end{landscape}"), .) } %>% 
+      { if_else(!is.null(filename), write(., str_c(output_path, "/", filename, ".tex")), cat(.)) }
+    
+  } else {
+    return(list(df, rdf, ll))
+  }
+}
+
+slope_model <- function(., slope_variable) {
+  lmer(paste0("discrimination_centroid ~ thread_age + `thread_age^2` + comment_age + politics_comments + MeToo + BLM + OscarsSoWhite + sexism_keywords + racism_keywords + (1|submission_id) + (1+", slope_variable, "|author)"),
+       data = ., REML = FALSE, 
+       control = lmerControl(optimizer ="Nelder_Mead")
+  )
 }
 
 ```
@@ -148,14 +294,16 @@ comments <- comments %>%
     )
 
 # Other data ----
-# model <- read.word2vec(file = py$binary_wv_file, normalize = TRUE)
-
 tmdb <- read_delim(py$submissions_tmdb_file, delim = ";")
 genres <- tmdb %>% select(`Science Fiction`:Documentary) %>% colnames()
 
 comments <- tmdb %>% 
   select(all_of(c("submission_id", genres))) %>% 
   right_join(comments)
+
+tweets <- read_csv(py$count_file)
+
+# model <- read.word2vec(file = py$binary_wv_file, normalize = TRUE)
 ```
 ```{r cmd}
 # https://cran.r-project.org/web/packages/text2map/vignettes/CMDist-concept-movers-distance.html
@@ -167,9 +315,6 @@ wv <- read_csv(py$wvdf_file) %>%
 
 dtm <- comments %>% 
   dtm_builder(tokenized_body, comment_id)
-
-# The problem with taking a single seed word is that grammar matters. If it's a plural noun, it more likely to find other plural nouns etc.
-# That said, differences are small
 
 concept_words <- c("sexism", "racism", "discrimination")
 sexism_words <- c("sexism", "metoo", "sexist", "sexual_harassment", "misogyny", "patriarchy",
@@ -202,54 +347,75 @@ comments <- comments %>%
 rm(dtm, doc_closeness, racism_closeness, discrimination_closeness, wv)
 ```
 ```{r descriptives}
-# Number of discussion threads per month ----
-comments %>% 
+# disc per submission ----
+submissions <- comments %>% 
   group_by(submission_id, film_title) %>% 
-  summarise(Date = min(Date)) %>%
-  mutate(Date = floor_date(Date, "month")) %>% 
-  ggplot(aes(Date)) + 
-  geom_bar() + 
-  scale_x_date(
-    date_breaks = "2 months", date_labels = "%b '%y", 
-    expand = expansion(mult = c(0, 0))) + 
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+  summarise(
+    across(where(is.numeric), ~ mean(.x))
+  ) %>% 
+  ungroup() %>% 
+  mutate(Keywords = case_when(
+    racism_keywords == 0 & sexism_keywords == 0 ~ "Neither",
+    racism_keywords == 1 & sexism_keywords == 0 ~ "Racism",
+    racism_keywords == 0 & sexism_keywords == 1 ~ "Sexism",
+    racism_keywords == 1 & sexism_keywords == 1 ~ "Both",
+    T ~ NA_character_
+  ))
 
-# Number of comments after creation date ----
-# plot_comment_age <- comments %>% 
-comments %>% 
-  filter(comment_age <= 30) %>% 
-  ggplot(aes(comment_age)) +
-  geom_bar(aes(y=..prop..)) +
-  scale_y_continuous(labels = scales::percent_format(accuracy = 2),
-                     expand = expansion(mult = c(0,0.02))) +
-  scale_x_continuous(expand = expansion(mult = c(0,0))) +
+plot_disc_mean <- submissions %>% 
+  mutate(label = if_else(discrimination_centroid > 1 | discrimination_centroid < -0.5, film_title, NA_character_)) %>% 
+  mutate(thread_date = date(min_date+dyears(thread_age))) %>% 
+  arrange(match(Keywords, c("Neither", "Racism", "Sexism", "Both"))) %>% 
+  ggplot(aes(thread_date, discrimination_centroid, 
+             color = fct_inorder(Keywords), shape = fct_inorder(Keywords),
+             label = label
+  )) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(color="black",
+                           na.rm=T, show.legend = F,
+                           # direction = "y", nudge_y = .01
+  ) +
+  scale_color_viridis_d(direction = -1) +
+  scale_x_date(breaks = seq(from = min_date, to = max_date, by = "2 months"),
+               date_labels = "%b '%y",
+               expand = expansion(mult = c(0.005, 0.005))
+               ) +
   labs(
-    x = "Days Between Thread Creation and Comment Creation",
-    y = "Proportion of Comments"
-  )
+    x = element_blank(),
+    y = "Mean Discrimination Engagement",
+    color = "Keywords:",
+    shape = "Keywords:",
+  ) +
+  theme(legend.position = "top",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
 
-# plot_comment_age
+plot_disc_mean
 
-# Effect of time ----
-comments %>% 
-  ggplot(aes(Date, discrimination_centroid)) +
-  geom_smooth(method="lm", se=T, color="red", fill="red") +
-  geom_smooth(method="lm", formula = "y ~ poly(x, 2)", se=T, color="yellow", fill="yellow") +
-  geom_smooth(method="lm", formula = "y ~ poly(x, 3)", se=F, color="green") +
-  geom_smooth(method="lm", formula = "y ~ poly(x, 4)", se=F, color="blue") +
-  geom_smooth(method="lm", formula = "y ~ poly(x, 5)", se=T, color="purple", fill="purple") +
-  # scale_x_date(
-  #   date_breaks = "1 years", date_labels = "%Y", 
-  #   expand = expansion(mult = c(0, 0))) + 
-    scale_x_date(date_breaks = "2 months", date_labels = "%b '%y",
-               expand = expansion(mult = c(0, 0))) +
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+# disc distribution ----
+thread_selection <- comments %>% 
+  group_by(submission_id) %>% 
+  summarise(mn = mean(discrimination_centroid)) %>% 
+  arrange(desc(mn)) %>% 
+  filter(row_number() %% 38 == 1) %>% 
+  pull(submission_id)
 
-  
-# Descriptive statistics ----
-var_selection <- comments %>% 
-  select(all_of(c("thread_age", "comment_age", "politics_comments", movements, "sexism_keywords", "racism_keywords")) | ends_with("_cmd") | ends_with("_centroid")) %>% 
-  colnames()
+plot_distr <- comments %>% 
+  filter(submission_id %in% thread_selection) %>% 
+  ggplot(aes(fct_reorder(film_title, discrimination_centroid), discrimination_centroid, 
+             fill=fct_reorder(film_title, discrimination_centroid),
+             color=fct_reorder(film_title, discrimination_centroid))) +
+  geom_violin() +
+  scale_y_continuous(expand = expansion(mult = c(0.02,0))) +
+  scale_fill_ordinal() +
+  scale_color_ordinal() +
+  labs(
+    x = element_blank(),
+    y = "Discrimination Engagement"
+  ) +
+  theme(
+    legend.position = "none"
+  ) +
+  coord_flip()
 
 comments %>% 
   select(var_selection) %>% 
@@ -258,7 +424,22 @@ comments %>%
 
 # Correlations ----
 plot_correlations <-  comments %>% 
-  select(var_selection) %>%
+  select(all_of(var_selection)) %>%
+  rename_with(
+      ~ case_when(
+        .x == "MeToo" ~ "#MeToo Tweets",
+        .x == "BLM" ~ "#BlackLivesMatter Tweets",
+        .x == "OscarsSoWhite" ~ "#OscarsSoWhite Tweets",
+        .x == "sexism_keywords" ~ "Sexism Keyword",
+        .x == "racism_keywords" ~ "Racism Keyword",
+        .x == "politics_comments" ~ "Politics Comments",
+        .x == "thread_age" ~ "Film Discussion Creation",
+        .x == "thread_age^2" ~ "Film Discussion Creation^{2}",
+        .x == "comment_age" ~ "Comment Creation",
+        .x == "discrimination_centroid" ~ "Discrimination Engagement",
+        T ~ .x
+      )
+    ) %>% 
   plot_corr()
 
 plot_correlations
@@ -269,179 +450,7 @@ plot_concepts <-  comments %>%
 
 plot_concepts
 
-# tmdb stuff ----
-tmdb %>% 
-  select(where(is.numeric)) %>%
-  select(sexism_keywords, racism_keywords, everything()) %>% 
-  plot_corr()
-
-tmdb %>% 
-  select(sexism_keywords, racism_keywords, film_title) %>% 
-  mutate(x = n()) %>% 
-  group_by(racism_keywords) %>% 
-  summarise(fre = n()/x) %>% 
-  tally()
-
-tmdb %>% 
-  select(sexism_keywords, racism_keywords, film_title) %>% 
-  arrange(desc(racism_keywords))
-
-tmdb %>% 
-  select(sexism_keywords, racism_keywords, film_title) %>% 
-  reshape2::melt(id.vars = "film_title", variable.name = "Keyword") %>% 
-  ggplot(aes(value, color = Keyword, fill = Keyword)) +
-  geom_bar(aes(y=..prop..), position = "dodge") +
-  scale_y_continuous(labels = scales::percent_format(accuracy = 1), n.breaks = 10)
-
-```
-```{r multilevel}
-# step 1: Intercept only model ----
-m1 <- comments %>% 
-  lmer(
-    discrimination_centroid ~ 
-      (1|submission_id) + (1|author), ., REML = FALSE,
-    control = lmerControl(optimizer ="Nelder_Mead")
-       )
-
-# step 2: Comment level variables ----
-m2 <- comments %>% 
-  lmer(discrimination_centroid ~ comment_age +
-         (1|submission_id) + (1|author), 
-       data = ., REML = FALSE,
-       control = lmerControl(optimizer ="Nelder_Mead")
-       )
-
-# step 3: Author and submission level variables ----
-m3 <- comments %>%
-  lmer(discrimination_centroid ~ 
-         thread_age + `thread_age^2` +
-         comment_age +
-         politics_comments + 
-         MeToo + BLM + OscarsSoWhite +
-         sexism_keywords + racism_keywords +
-         (1|submission_id) + (1|author), 
-       data = ., REML = FALSE,
-       control = lmerControl(optimizer ="Nelder_Mead")
-       )
-
-m3a <- comments %>%
-  lmer(discrimination_centroid ~ 
-         thread_age +
-         (1|submission_id) + (1|author), 
-       data = ., REML = FALSE,
-       control = lmerControl(optimizer ="Nelder_Mead")
-       )
-
-m3b <- comments %>%
-  lmer(discrimination_centroid ~ 
-         thread_age + `thread_age^2` +
-         (1|submission_id) + (1|author), 
-       data = ., REML = FALSE,
-       control = lmerControl(optimizer ="Nelder_Mead")
-       )
-
-anova(m3a, m3b)
-
-m3c <- comments %>%
-  lmer(discrimination_centroid ~ 
-         thread_age + `thread_age^2` +
-         # comment_age +
-         # politics_comments + 
-         # MeToo + BLM + OscarsSoWhite +
-         sexism_keywords + racism_keywords +
-         (1|submission_id) + (1|author), 
-       data = ., REML = FALSE,
-       control = lmerControl(optimizer ="Nelder_Mead")
-       )
-
-# paste(genres, collapse = " + ") ----
-m3f <- comments %>% 
-  mutate("thread_age^2" = thread_age^2) %>% 
-  lmer(discrimination_centroid ~ comment_age +
-         politics_comments + movies_comments +
-         `thread_age^2` +
-         thread_age * vote_count +
-         vote_average + 
-         sexism_keywords + racism_keywords +
-         MeToo + BLM + OscarsSoWhite +
-         `Science Fiction` + Action + Adventure + Fantasy + Crime + Thriller + Drama + Comedy + 
-         Horror + Mystery + War + Animation + Family + History + Western + Romance + Music + 
-         `TV Movie` + Documentary +
-         (1|submission_id) + (1|author), 
-       data = ., REML = FALSE,
-       control = lmerControl(optimizer ="Nelder_Mead")
-       )
-
-# step 4: Random slope ----
-m4 <- comments %>%
-  lmer(discrimination_centroid ~ 
-         thread_age + `thread_age^2` +
-         comment_age +
-         politics_comments + 
-         MeToo + BLM + OscarsSoWhite +
-         sexism_keywords + racism_keywords +
-         (1|submission_id) + (1+thread_age|author), 
-       data = ., REML = FALSE,
-       control = lmerControl(optimizer ="Nelder_Mead")
-       )
-
-# step 5: cross-level interactions ----
-m5 <- comments %>%
-  lmer(discrimination_centroid ~ 
-         (thread_age + `thread_age^2`) * politics_comments +
-         comment_age +
-         MeToo + BLM + OscarsSoWhite +
-         sexism_keywords + racism_keywords +
-         (1|submission_id) + (1+thread_age|author), 
-       data = ., REML = FALSE,
-       control = lmerControl(optimizer ="Nelder_Mead")
-       )
-
-m5a <- comments %>%
-  lmer(discrimination_centroid ~ 
-         thread_age * politics_comments + `thread_age^2` + 
-         comment_age +
-         MeToo + BLM + OscarsSoWhite +
-         sexism_keywords + racism_keywords +
-         (1|submission_id) + (1+thread_age|author), 
-       data = ., REML = FALSE,
-       control = lmerControl(optimizer ="Nelder_Mead")
-       )
-
-anova(m4, m5a, m5)
-# Output ----
-stargazer(m1, m3b, m3, m4, m5, type = "text")
-get_models(m1, m3b, m3, m4, m5)
-
-anova(m1, m2, m3b, m3, m4)
-
-summary(m1)
-get_fixed(m1)
-get_random(m1)
-get_sum(m1)
-# viz ----
-# should use ranef() instead to get condVar, but its extremely slow
-pred_values <- submissions %>% 
-  predict_submission(m1) %>% 
-  predict_submission(m3a) %>% 
-  predict_submission(m3) %>% 
-  predict_submission(m4)
-
-pred_values %>% 
-  reshape2::melt(
-    measure.vars = c("m1", "m3a", "m3", "m4"),
-    variable.name = "Model",
-    value.name = "Ranef"
-    ) %>% 
-  as_tibble() %>% 
-  ggplot(aes(thread_date, Ranef, color = Model)) +
-  geom_smooth(method = "loess", se = F)
-
-```
-```{r other data}
 # Monthly Tweets ----
-tweets <- read_csv(py$count_file)
-
 plot_monthly_tweets <- tweets %>% 
   filter(Date >= min_date,
          Date < max_date) %>% 
@@ -493,55 +502,30 @@ plot_monthly_tweets <- tweets %>%
 
 plot_monthly_tweets
 
-# disc per submission ----
-submissions <- comments %>% 
-  group_by(submission_id, film_title) %>% 
-  summarise(
-    mean = mean(discrimination_centroid),
-    thread_date = min(thread_date),
-    thread_age = min(thread_age),
-    racism_keywords = min(racism_keywords),
-    sexism_keywords = min(sexism_keywords),
-    n_comments = n()
-  )
-
-plot_disc_mean <- submissions %>% 
-  mutate(Keywords = case_when(
-    racism_keywords == 0 & sexism_keywords == 0 ~ "Neither",
-    racism_keywords == 1 & sexism_keywords == 0 ~ "Racism",
-    racism_keywords == 0 & sexism_keywords == 1 ~ "Sexism",
-    racism_keywords == 1 & sexism_keywords == 1 ~ "Both",
-    T ~ NA_character_
-  ),
-  label = if_else(mean > 1 | mean < -0.5, film_title, NA_character_)
-  ) %>% 
-  arrange(match(Keywords, c("Neither", "Racism", "Sexism", "Both"))) %>% 
-  ggplot(aes(thread_date, mean, 
-             color = fct_inorder(Keywords), shape = fct_inorder(Keywords),
-             label = label
-  )) +
-  geom_point(size = 3) +
-  ggrepel::geom_text_repel(color="black",
-                           na.rm=T, show.legend = F,
-                           # direction = "y", nudge_y = .01
-  ) +
-  scale_color_viridis_d(direction = -1) +
-  scale_x_date(breaks = seq(from = min_date, to = max_date, by = "2 months"),
-               date_labels = "%b '%y",
-               expand = expansion(mult = c(0.005, 0.005))
-               ) +
-  labs(
-    x = element_blank(),
-    y = "Mean Discrimination Centroid",
-    color = "Keywords:",
-    shape = "Keywords:",
-  ) +
-  theme(legend.position = "top",
-        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-
-plot_disc_mean
-
 # tmdb ----
+tmdb %>% 
+  select(where(is.numeric)) %>%
+  select(sexism_keywords, racism_keywords, everything()) %>% 
+  plot_corr()
+
+tmdb %>% 
+  select(sexism_keywords, racism_keywords, film_title) %>% 
+  mutate(x = n()) %>% 
+  group_by(racism_keywords) %>% 
+  summarise(fre = n()/x) %>% 
+  tally()
+
+tmdb %>% 
+  select(sexism_keywords, racism_keywords, film_title) %>% 
+  arrange(desc(racism_keywords))
+
+tmdb %>% 
+  select(sexism_keywords, racism_keywords, film_title) %>% 
+  reshape2::melt(id.vars = "film_title", variable.name = "Keyword") %>% 
+  ggplot(aes(value, color = Keyword, fill = Keyword)) +
+  geom_bar(aes(y=..prop..), position = "dodge") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), n.breaks = 10)
+
 tmdb %>%
   filter(date >= min_date,
          date < max_date) %>% 
@@ -574,6 +558,235 @@ tmdb %>%
   guides(
     linetype=guide_legend(keywidth = 1.8, keyheight = 1),
     color=guide_legend(keywidth = 1.8, keyheight = 1))
+# PEW ----
+pew_surveys <- c("Autumn 2016", "Autumn 2018", "Spring 2019", "Autumn 2019", "Spring 2021")
+pew_labs <- list(bquote(atop("Autumn", ~2016^a)),
+                 bquote(atop("Autumn", ~2018^b)),
+                 bquote(atop("Spring", ~2019^c)),
+                 bquote(atop("Autumn", ~2019^d)),
+                 bquote(atop("Spring", ~2021^e))
+)
+
+names(pew_labs) <- pew_surveys
+
+plot_pew <- tibble(
+  Survey = pew_surveys,
+  Sexism_big = c(.21, .34, .26, .26, .23),
+  Sexism_mod = c(.36, .35, .40, .35, .36),
+  Sexism_small = c(.34,.24,.28,.29,.30),
+  Sexism_not = c(.08,.07,.05,.09,.10),
+  Racism_big = c(.36,.46,.4,.43,.45),
+  Racism_mod = c(.41,.32,.37,.31,.27),
+  Racism_small = c(.2,.18,.19,.21,.2),
+  Racism_not = c(.03,.04,.03,.04,.07)
+) %>% 
+  pivot_longer(!Survey, names_to = c("Disc", "Level"), names_sep = "_", values_to = "Percent") %>% 
+  arrange(match(Survey, pew_surveys), 
+          match(Level, c("not", "small", "mod", "big"))) %>% 
+  ggplot(aes(fct_inorder(Survey), Percent, fill = fct_inorder(Level))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~ Disc, nrow = 1) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0,.09))) +
+  scale_x_discrete(expand = expansion(mult = c(0,0)),
+                   labels = pew_labs) +
+  scale_fill_brewer(
+    labels = c("Not a problem at all",
+               "A small problem",
+               "A moderately big problem",
+               "A very big problem"),
+    palette = "BuGn"
+  ) +
+  labs(
+    fill = element_blank(),
+    x = element_blank(),
+    y = element_blank()
+  ) +
+  theme(
+    legend.position = "top",
+    strip.text = element_text(size = 16),
+    panel.spacing = unit(2, "lines")
+  )
+
+plot_pew
+```
+```{r multilevel}
+# step 1: Intercept only model ----
+m1 <- comments %>% 
+  lmer(
+    discrimination_centroid ~ 
+      (1|submission_id) + (1|author), ., REML = FALSE,
+    control = lmerControl(optimizer ="Nelder_Mead")
+       )
+
+# step 3: Author and submission level variables ----
+m3 <- comments %>%
+  lmer(discrimination_centroid ~ 
+         thread_age + `thread_age^2` +
+         comment_age +
+         politics_comments + 
+         MeToo + BLM + OscarsSoWhite +
+         sexism_keywords + racism_keywords +
+         (1|submission_id) + (1|author), 
+       data = ., REML = FALSE,
+       control = lmerControl(optimizer ="Nelder_Mead")
+       )
+
+m3a <- comments %>%
+  lmer(discrimination_centroid ~ 
+         thread_age +
+         (1|submission_id) + (1|author), 
+       data = ., REML = FALSE,
+       control = lmerControl(optimizer ="Nelder_Mead")
+       )
+
+m3b <- comments %>%
+  lmer(discrimination_centroid ~ 
+         thread_age + `thread_age^2` +
+         (1|submission_id) + (1|author), 
+       data = ., REML = FALSE,
+       control = lmerControl(optimizer ="Nelder_Mead")
+       )
+# step 4: Random slope ----
+m4 <- comments %>%
+  slope_model("thread_age")
+
+m4a <- comments %>%
+  slope_model("MeToo") 
+
+m4b <- comments %>% 
+  slope_model("BLM")
+
+m4c <- comments %>% 
+  slope_model("OscarsSoWhite")
+
+m4d <- comments %>% 
+  slope_model("comment_age")
+
+m4e <- comments %>% 
+  slope_model("sexism_keywords")
+
+m4f <- comments %>% 
+  slope_model("racism_keywords")
+
+m4g <- comments %>%
+  lmer(discrimination_centroid ~ 
+         thread_age + `thread_age^2` +
+         comment_age +
+         politics_comments + 
+         MeToo + BLM + OscarsSoWhite +
+         sexism_keywords + racism_keywords +
+         (1+comment_age|submission_id) + (1|author), 
+       data = ., REML = FALSE,
+       control = lmerControl(optimizer ="Nelder_Mead")
+       )
+
+m4gb <- comments %>%
+  lmer(discrimination_centroid ~ 
+         thread_age + `thread_age^2` +
+         comment_age +
+         politics_comments + 
+         MeToo + BLM + OscarsSoWhite +
+         sexism_keywords + racism_keywords +
+         (1+ politics_comments |submission_id) + (1|author), 
+       data = ., REML = FALSE,
+       control = lmerControl(optimizer ="Nelder_Mead")
+       )
+
+slope_models <- list(
+  "Film Disc. Creation/Commenter" = m4,
+  "#MeToo/Commenter" = m4a,
+  "#BLM/Commenter" = m4b,
+  "#OscarsSoWhite/Commenter" = m4c,
+  "Comment Creation/Commenter" = m4d,
+  "Sexism Keyword/Commenter" = m4e,
+  "Racism Keyword/Commenter" = m4f,
+  "Comment Creation/Film Discussion" = m4g,
+  "Politics Comments/Film Discussion" = m4gb
+)
+
+slope_improvements <- slope_models %>% 
+  map(~ anova(m3, .x)) %>% 
+  bind_rows(.id = "Model") %>% 
+  as_tibble() %>% 
+  filter((row_number() %% 2 != 1) | (row_number() == 1)) %>% 
+  mutate(
+    Model = if_else(row_number() == 1, "Variance Component Model", Model)
+  )
+
+m4h <- comments %>% # Failed to converge in 10000 evaluations
+  lmer(discrimination_centroid ~ 
+         thread_age + `thread_age^2` +
+         comment_age +
+         politics_comments + 
+         MeToo + BLM + OscarsSoWhite +
+         sexism_keywords + racism_keywords +
+         (1|submission_id) + (1 + thread_age + MeToo + BLM + OscarsSoWhite + comment_age + sexism_keywords + racism_keywords |author), 
+       data = ., REML = FALSE,
+       control = lmerControl(optimizer ="Nelder_Mead")
+       )
+
+m4i <- comments %>% # Failed to converge in 10000 evaluations
+  lmer(discrimination_centroid ~ 
+         thread_age + `thread_age^2` +
+         comment_age +
+         politics_comments + 
+         MeToo + BLM + OscarsSoWhite +
+         sexism_keywords + racism_keywords +
+         (1|submission_id) + (1 + thread_age + MeToo + OscarsSoWhite + racism_keywords |author), 
+       data = ., REML = FALSE, control = lmerControl(optimizer ="Nelder_Mead")
+       )
+
+m4j <- comments %>% # singular fit. Perfect correlation between the slope of thread age and author intercept
+  lmer(discrimination_centroid ~ 
+         thread_age + `thread_age^2` +
+         comment_age +
+         politics_comments +
+         MeToo + BLM + OscarsSoWhite +
+         sexism_keywords + racism_keywords +
+         (1|submission_id) + (1 + thread_age + racism_keywords | author), 
+       data = ., REML = FALSE, control = lmerControl(optimizer ="Nelder_Mead")
+       )
+
+# step 5: cross-level interactions ----
+m5 <- comments %>%
+  lmer(discrimination_centroid ~ 
+         (thread_age + `thread_age^2`) * politics_comments +
+         comment_age +
+         MeToo + BLM + OscarsSoWhite +
+         sexism_keywords + racism_keywords +
+         (1|submission_id) + (1+thread_age|author), 
+       data = ., REML = FALSE,
+       control = lmerControl(optimizer ="Nelder_Mead")
+       )
+
+m5_transformed <- comments %>% 
+  mutate(discrimination_centroid = log(discrimination_centroid+max(discrimination_centroid)+1)) %>% 
+  lmer(discrimination_centroid ~ 
+         (thread_age + `thread_age^2`) * politics_comments +
+         comment_age +
+         MeToo + BLM + OscarsSoWhite +
+         sexism_keywords + racism_keywords +
+         (1|submission_id) + (1+thread_age|author), 
+       data = ., REML = FALSE,
+       control = lmerControl(optimizer ="Nelder_Mead")
+  )
+
+# Output ----
+stargazer(m1, m3b, m3, m4, m5, type = "text")
+get_models(m1, m3b, m3, m4, m5)
+anova(m1, m2, m3b, m3, m4)
+```
+```{r diagnostics}
+(plot_m1_qq <- qqmath(m1))
+
+res_m1 <- resid(m1)
+ranef_m1 <- ranef(m1, condVar=F)
+
+(plot_m1_qq_level2 <- qqmath(ranef_m1))
+
+(plot_m1_srvf <- plot(m1))
+
 ```
 ```{r exporting}
 # figures ----
@@ -581,23 +794,41 @@ save_plot(plot_monthly_tweets, "monthly_tweets.pdf")
 save_plot(plot_concept, "concept_correlations.pdf", 8, 6)
 save_plot(plot_correlations, "correlations.pdf", 8, 6)
 save_plot(plot_disc_mean, "thread_discrimination.pdf")
+save_plot(plot_distr, "disc_distribution.pdf")
+save_plot(plot_pew, "pew.pdf")
+
+png(file = paste0(figures_path, "/qq_m1_l1.png"))
+plot_m1_qq
+dev.off()
+
+png(file = paste0(figures_path, "/qq_m1_author.png"))
+plot_m1_qq_level2$author
+dev.off()
+
+png(file = paste0(figures_path, "/qq_m1_sub.png"))
+plot_m1_qq_level2$submission_id
+dev.off()
+
+png(file = paste0(figures_path, "/srvf_m1_l1.png"))
+plot_m1_srvf
+dev.off()
 
 # results ----
-get_models(m1, m3b, m3, m4, m5, model_names = c("m1", "m3b", "m3","m4", "m5"), latex = T, filename = "multilevel")
+get_models(m1, m3b, m3, m4, m5, model_names = c("Intercept Only", "Film Disc. Creation", "Full VCM","Random Slope", "Interaction"), latex = T, filename = "multilevel")
 
-anova(m1, m3a, m3b, m3, m4, m5) %>% 
+slope_improvements %>% 
   xtable(
-        caption = "Likelihood-Ratio Test for Model Improvement over Previous Model",
-        label = "tab:Anova",
+        caption = "Likelihood-Ratio Test for Random Slope Models Improvement over Variance Component Model",
+        label = "tab:Slope",
         digits = c(rep(0, ncol(.)), 3),
-        align = c("l", rep("C", ncol(.)))
+        align = c("l", "l", rep("C", ncol(.)-1))
       ) %>% 
       print(
-        table.placement = "htb",
+        table.placement = "tb",
         caption.placement = "top",
         latex.environments = "threeparttable",
         tabular.environment = "tabular",
-        # include.rownames = F,
+        include.rownames = F,
         #math.style.negative = T,
         print.results = F,
         booktabs = T,
@@ -605,13 +836,50 @@ anova(m1, m3a, m3b, m3, m4, m5) %>%
         comment = F,
         size = "\\sisetup{parse-numbers= false, mode=text}"
       ) %>% 
-  # str_replace("Pr\\(\\$\\>\\$Chisq\\)", "{p}") %>% 
-  # str_replace_all("Chisq", "$\\\\chi^2$") %>%
   str_replace("& npar & AIC & BIC & logLik & deviance & Chisq & Df & Pr\\(\\$\\>\\$Chisq\\)",
               "& {npar} & {AIC} & {BIC} & {logLik} & {deviance} & {$\\\\chi^2$} & {Df} & {p}") %>% 
   str_replace_all("0\\.000", "<.001") %>% 
   str_replace_all("0\\.", ".") %>% 
-  str_replace("C{3,999}", " @{ }S[table-format=2.0]@{ } *{4}{@{ }S[table-format=-7.0]@{ }} @{ }S[table-format=4.0]@{ } @{ }S[table-format=2.0]@{ } @{ }S[table-format=<.3]@{ }"
+  str_replace("C{3,999}", " @{}S[table-format=2.0]@{} *{4}{@{}S[table-format=-7.0]@{}} @{ }S[table-format=4.0]@{} @{ }S[table-format=2.0]@{} @{ }S[table-format=<.3]@{}"
+              ) %>% 
+  # cat()
+  write(., paste0(output_path, "/slope.tex"))
+
+anova(m1, m3a, m3b, m3, m4, m5) %>% 
+  as_tibble(rownames = "Model") %>% 
+  mutate(Model = case_when(
+    Model == "m1" ~ "Intercept Only",
+    Model == "m3a" ~ "+ Linear Effect Thread Creation",
+    Model == "m3b" ~ "+ Quadratic Effect Thread Creation",
+    Model == "m3" ~ "Full Variance Component Model",
+    Model == "m4" ~ "+ Slope for Creation/Commenter",
+    Model == "m5" ~ "+ Film Disc. Creation X Pol. Comments",
+    T ~ Model
+  )) %>% 
+  xtable(
+        caption = "Likelihood-Ratio Test for Model Improvement over Previous Model",
+        label = "tab:Anova",
+        digits = c(rep(0, ncol(.)), 3),
+        align = c("l", "l", rep("C", ncol(.)-1))
+      ) %>% 
+      print(
+        table.placement = "tb",
+        caption.placement = "top",
+        latex.environments = "threeparttable",
+        tabular.environment = "tabular",
+        include.rownames = F,
+        #math.style.negative = T,
+        print.results = F,
+        booktabs = T,
+        # width = "\\linewidth",
+        comment = F,
+        size = "\\sisetup{parse-numbers= false, mode=text}"
+      ) %>% 
+  str_replace("& npar & AIC & BIC & logLik & deviance & Chisq & Df & Pr\\(\\$\\>\\$Chisq\\)",
+              "& {npar} & {AIC} & {BIC} & {logLik} & {deviance} & {$\\\\chi^2$} & {Df} & {p}") %>% 
+  str_replace_all("0\\.000", "<.001") %>% 
+  str_replace_all("0\\.", ".") %>% 
+  str_replace("C{3,999}", " @{}S[table-format=2.0]@{} *{4}{@{}S[table-format=-7.0]@{}} @{}S[table-format=4.0]@{} @{ }S[table-format=2.0]@{} @{ }S[table-format=<.3]@{}"
               ) %>% 
   # cat()
   write(., paste0(output_path, "/anova.tex"))
@@ -635,7 +903,6 @@ comments %>%
         caption = "Words Used for Concept Mover's Distance (CMD)",
         label = "tab:CmdConcept",
         align = c(rep("l", 2), rep("L", ncol(.)-1)),
-        #display = c("s", "s", rep("f", ncol(.)-1))
       ) %>% 
       print(
         table.placement = "htb",
@@ -649,8 +916,6 @@ comments %>%
         booktabs = T,
         width = "\\linewidth",
         comment = F,
-        # size = "\\sisetup{parse-numbers= false, mode=text}",
-        #add.to.row = list(pos=list(0), command=c("gu"))
       ) %>% 
   write(., paste0(output_path, "/concept_words.tex"))
 
@@ -681,6 +946,16 @@ comments %>%
       ) %>% 
   str_replace(., "C{3,999}", str_c(" *{", str_length(str_extract(., "C{3,999}")), "}{@{ }S[table-format=-1.2]@{ }}")) %>%
   str_replace("Variable & Mean & Sd & Min & Max", " & {Mean} & {S.D.} & {Min} & {Max}") %>% 
+  str_replace_all("thread\\\\_age", "Film Discussion Creation") %>%
+  str_replace_all("comment\\\\_age", "Comment Creation") %>%
+  str_replace_all("politics\\\\_comments", "Politics Comments") %>%
+  str_replace_all("sexism\\\\_keywords", "Sexism Keyword") %>%
+  str_replace_all("racism\\\\_keywords", "Racism Keyword") %>%
+  str_replace_all("(MeToo|BLM|OscarsSoWhite)", "\\\\#\\1 Tweets") %>%
+  str_replace_all("discrimination\\\\_centroid", "Discrimination Concept Engagement") %>%
+  str_replace_all("`", "") %>%
+  str_replace("end\\{tabular\\}", "end{tabular}\n\\\\fnote{\\\\textit{Note.} N(comments) = 1,121,391.}"
+  ) %>% 
   write(., paste0(output_path, "/desc_stats.tex"))
   # cat()
 
@@ -705,14 +980,15 @@ read_csv(py$embedding_results_file) %>%
     width = "\\linewidth",
     comment = F
   ) %>% 
-  str_replace(., "Google", "\\\\% Correct Google Analogies\\\\tnote{a}") %>% 
-  str_replace(., "Wordsim", "WordSim-353 Spearman's $\\\\rho$\\\\tnote{b}") %>% 
+  str_replace(., "Google", "\\\\% Correct Google Analogies$^{a}$") %>% 
+  str_replace(., "Wordsim", "WordSim-353 Spearman's $\\\\rho^{b}$") %>% 
   str_replace(., "25 & 300 & 0.459 & 0.568", "\\\\textbf{25} & \\\\textbf{300} & \\\\textbf{0.459} & \\\\textbf{0.568}") %>% 
-  str_replace(., "end\\{tabulary\\}", "end{tabulary}\n\\\\begin{tablenotes}\n\\\\item \\\\textit{Note.} Model trained using Gensim's Word2Vec. Chosen model in bold.\n\\\\item [a] Google Analogy Test \\\\parencite{Mikolov2013}.\n\\\\item [b] WordSimilarity-353 \\\\parencite{Finkelstein2001}.\n\\\\end{tablenotes}") %>% 
+  str_replace(., "end\\{tabulary\\}", "end{tabulary}\n\\\\fnote{\\\\textit{Note.} Model trained using Gensim's Word2Vec. Chosen model in bold.}\n\\\\fnote{$^{a} =$ Google Analogy Test \\\\parencite{Mikolov2013}.}\n\\\\fnote{$^{b} =$ WordSimilarity-353 \\\\parencite{Finkelstein2001}.}") %>% 
   write(., paste0(output_path, "/embeddingResults.tex"))
 ```
 ```{r graveyard} 
 # functions ----
+se <- function(x) sd(x)/sqrt(length(x))
 
 lm_fitted <- function(.data, formula) {
   if (dplyr::is_grouped_df(.data)) {
@@ -781,6 +1057,37 @@ comments %>%
     y = "Cumulative % of submissions"
   )
 
+# Number of comments after creation date ----
+# plot_comment_age <- comments %>% 
+comments %>% 
+  filter(comment_age <= 30) %>% 
+  ggplot(aes(comment_age)) +
+  geom_bar(aes(y=..prop..)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 2),
+                     expand = expansion(mult = c(0,0.02))) +
+  scale_x_continuous(expand = expansion(mult = c(0,0))) +
+  labs(
+    x = "Days Between Thread Creation and Comment Creation",
+    y = "Proportion of Comments"
+  )
+
+# plot_comment_age
+
+# Number of discussion threads per month ----
+comments %>% 
+  group_by(submission_id, film_title) %>% 
+  summarise(Date = min(Date)) %>%
+  mutate(Date = floor_date(Date, "month")) %>% 
+  ggplot(aes(Date)) + 
+  geom_bar() + 
+  scale_x_date(
+    date_breaks = "2 months", date_labels = "%b '%y", 
+    expand = expansion(mult = c(0, 0))) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+# Descriptive statistics ----
+var_selection <- comments %>% 
+  select(all_of(c("thread_age", "comment_age", "politics_comments", movements, "sexism_keywords", "racism_keywords")) | ends_with("_cmd") | ends_with("_centroid")) %>% 
+  colnames()
 # Linear models ----
 lin <- comments %>% 
   filter(Date >= ymd("2014-01-01"),
@@ -848,6 +1155,21 @@ comments %>%
   summarise(sexism_centroid = mean(sexism_centroid)) %>% 
   ggplot(aes(sexism_keywords, sexism_centroid)) +
   geom_bar(stat = "identity")
+
+# Effect of time ----
+comments %>% 
+  ggplot(aes(Date, discrimination_centroid)) +
+  geom_smooth(method="lm", se=T, color="red", fill="red") +
+  geom_smooth(method="lm", formula = "y ~ poly(x, 2)", se=T, color="yellow", fill="yellow") +
+  geom_smooth(method="lm", formula = "y ~ poly(x, 3)", se=F, color="green") +
+  geom_smooth(method="lm", formula = "y ~ poly(x, 4)", se=F, color="blue") +
+  geom_smooth(method="lm", formula = "y ~ poly(x, 5)", se=T, color="purple", fill="purple") +
+  # scale_x_date(
+  #   date_breaks = "1 years", date_labels = "%Y", 
+  #   expand = expansion(mult = c(0, 0))) + 
+    scale_x_date(date_breaks = "2 months", date_labels = "%b '%y",
+               expand = expansion(mult = c(0, 0))) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
 
 # Grouped by date ----
 daily <- comments %>% 
@@ -1072,4 +1394,86 @@ pred_values %>%
        # subtitle = "Formula: CMD from sexism ~ log( #MeToo tweets) * cumulative frequency of #MeToo tweets",
        x = element_blank(),
        y = "CMD from Sexism Centroid")
+# random slope models ----
+random_slope_models <- as.list(c(movements, "thread_age", "comment_age", "sexism_keywords", "racism_keywords")) %>% 
+  set_names() %>% 
+  map(
+    ~ lmer(paste0("discrimination_centroid ~ thread_age + `thread_age^2` + comment_age + politics_comments + MeToo + BLM + OscarsSoWhite + sexism_keywords + racism_keywords + (1|submission_id) + (1+", .x, "|author)"), 
+           data = comments, REML = FALSE, 
+           control = lmerControl(optimizer ="Nelder_Mead")
+    )
+  )
+# viz ----
+
+predict_submission <- function(.data, model) {
+  model_name <- deparse(substitute(model))
+  df <- ranef(model, condVar=F, whichel="submission_id") %>% 
+    as_tibble() %>% 
+    mutate({{ model_name }} := condval #+ fixef(model)[1]
+           ) %>% 
+    select(grp, {{ model_name }}) %>% 
+    rename("submission_id" = grp)
+    left_join(.data, df)
+}
+
+submissions <- submissions %>% 
+  mutate(pred_fixed = predict(!!m4, ., re.form = NA),
+         pred_f_m3b = predict(!!m3b, ., re.form = NA),
+         pred_vals = predict(!!m4, ., re.form = ~(1|submission_id)))
+
+submissions <- submissions %>%
+  predict_submission(m1) %>% 
+  predict_submission(m3b) %>% 
+  predict_submission(m3) %>% 
+  predict_submission(m4)
+
+pred_fixed <- fixef(m4)
+pred_fixed["thread_age"]
+
+tibble(
+  thread_age = seq(min(comments$thread_age), max(comments$thread_age), .001)
+) %>% 
+  mutate(
+    pred = thread_age*pred_fixed["thread_age"]+thread_age^2*pred_fixed["`thread_age^2`"]+pred_fixed["(Intercept)"]
+  ) %>% 
+  ggplot(aes(thread_age, pred)) +
+  geom_line()
+
+submissions %>%
+  ggplot(aes(film_title, pred_fixed)) +
+  geom_point()
+
+submissions %>% 
+  ggplot(aes(thread_age, pred_f_m3b)) +
+  geom_line()
+
+submissions %>% 
+  filter(abs(m4) > .5) %>% 
+  arrange(m4) %>% 
+  ggplot(aes(fct_inorder(film_title), m4)) +
+  geom_point() +
+  coord_flip()
+
+submissions %>% 
+  reshape2::melt(
+    measure.vars = c("m1", "m3b", "m3", "m4"),
+    variable.name = "Model",
+    value.name = "Ranef"
+    ) %>%  
+  as_tibble() %>% 
+  ggplot(aes(thread_age, Ranef, color = Model)) +
+  geom_point()
+
+submissions %>% 
+  filter(abs(m1) > .5) %>% 
+  arrange(m1) %>% 
+  reshape2::melt(
+    measure.vars = c("m1", "m3b", "m3", "m4"),
+    variable.name = "Model",
+    value.name = "Ranef"
+    ) %>%  
+  as_tibble() %>% 
+  ggplot(aes(fct_inorder(film_title), Ranef, color=Model)) +
+  geom_point() +
+  coord_flip()
 ```
