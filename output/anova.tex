@@ -1,0 +1,21 @@
+\begin{table}[tb]
+\begin{threeparttable}
+\caption{Likelihood-Ratio Test for Model Improvement over Previous Model} 
+\label{tab:Anova}
+\begingroup\sisetup{parse-numbers= false, mode=text}
+\begin{tabular}{l @{}S[table-format=2.0]@{} *{4}{@{}S[table-format=-7.0]@{}} @{}S[table-format=4.0]@{} @{ }S[table-format=2.0]@{} @{ }S[table-format=<.3]@{}}
+  \toprule
+Model & {npar} & {AIC} & {BIC} & {logLik} & {deviance} & {$\chi^2$} & {Df} & {p} \\ 
+  \midrule
+Intercept Only & 4 & 3047372 & 3047419 & -1523682 & 3047364 &  &  &  \\ 
+  + Linear Effect Thread Creation & 5 & 3047369 & 3047429 & -1523680 & 3047359 & 4 & 1 & .037 \\ 
+  + Quadratic Effect Thread Creation & 6 & 3047367 & 3047439 & -1523678 & 3047355 & 4 & 1 & .044 \\ 
+  Full Variance Component Model & 13 & 3045679 & 3045834 & -1522827 & 3045653 & 1702 & 7 & <.001 \\ 
+  + Slope for Creation/Commenter & 15 & 3044588 & 3044767 & -1522279 & 3044558 & 1095 & 2 & <.001 \\ 
+  + Film Disc. Creation X Pol. Comments & 17 & 3044590 & 3044792 & -1522278 & 3044556 & 3 & 2 & .282 \\ 
+   \bottomrule
+\end{tabular}
+\endgroup
+\end{threeparttable}
+\end{table}
+

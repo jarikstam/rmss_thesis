@@ -1,0 +1,34 @@
+\begin{table}[tb]
+\begin{threeparttable}
+\caption{Word Embedding Model Comparison} 
+\label{Embedding}
+\begin{tabulary}{\linewidth}{CCCC}
+  \toprule
+Window & Vector & \% Correct Google Analogies$^{a}$ & WordSim-353 Spearman's $\rho^{b}$ \\ 
+  \midrule
+5 & 200 & 0.449 & 0.524 \\ 
+  5 & 250 & 0.461 & 0.531 \\ 
+  5 & 300 & 0.468 & 0.537 \\ 
+  7 & 200 & 0.456 & 0.534 \\ 
+  7 & 250 & 0.462 & 0.548 \\ 
+  7 & 300 & 0.470 & 0.542 \\ 
+  10 & 200 & 0.453 & 0.540 \\ 
+  10 & 250 & 0.461 & 0.550 \\ 
+  10 & 300 & 0.465 & 0.555 \\ 
+  15 & 200 & 0.452 & 0.553 \\ 
+  15 & 250 & 0.457 & 0.556 \\ 
+  15 & 300 & 0.466 & 0.556 \\ 
+  25 & 200 & 0.444 & 0.552 \\ 
+  25 & 250 & 0.456 & 0.565 \\ 
+  \textbf{25} & \textbf{300} & \textbf{0.459} & \textbf{0.568} \\ 
+  50 & 200 & 0.439 & 0.550 \\ 
+  50 & 250 & 0.441 & 0.556 \\ 
+  50 & 300 & 0.445 & 0.561 \\ 
+   \bottomrule
+\end{tabulary}
+\fnote{\textit{Note.} Model trained using Gensim's Word2Vec. Chosen model in bold.}
+\fnote{$^{a} =$ Google Analogy Test \parencite{Mikolov2013}.}
+\fnote{$^{b} =$ WordSimilarity-353 \parencite{Finkelstein2001}.}
+\end{threeparttable}
+\end{table}
+

@@ -2,16 +2,15 @@ praw.ini
 twitter_keys.py
 .ipynb_checkpoints
 __pycache__
+raised_errors.txt
+5b_app_explore_comments.R
 .Rproj.user
 *.RData
 .RHistory
 Thesis.Rproj
-output/
 models/
-figures/
 !data/
 data/*
 
 !data/submissions_annotated.csv
 !data/keywords_daily_count.csv
-!data/politics_comments.csv
